@@ -32,13 +32,13 @@ using Matrix = Eigen::MatrixXf;
 using Vector = Eigen::VectorXf;
 
 struct Experience {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> state;
     int action;
     float reward;
     Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> next_state;
     bool done;
     float priority;
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
 class ConvNet {
@@ -63,7 +63,7 @@ public:
         std::mt19937 gen(42);
         std::normal_distribution<float> dist(0.0f, 0.02f);
         
-        auto init = [&](auto& m) { m = m.unaryExpr([&](auto){return dist(gen);}); };
+        auto init = [&](auto& m) { m = m.unaryExpr([&](auto x) { return dist(gen); }); };
         init(conv_weights);
         init(conv_biases);
         init(fc1_weights);
@@ -86,10 +86,10 @@ public:
                 for(int ch = 0; ch < INPUT_CHANNELS; ++ch) {
                     for(int dr = -1; dr <= 1; ++dr) {
                         for(int dc = -1; dc <= 1; ++dc) {
-                            int input_r = r + dr;
-                            int input_c = c + dc;
-                            if(input_r >=0 && input_r < ROWS && input_c >=0 && input_c < COLS) {
-                                int input_pos = input_r * COLS + input_c;
+                            int nr = r + dr;
+                            int nc = c + dc;
+                            if(nr >=0 && nr < ROWS && nc >=0 && nc < COLS) {
+                                int input_pos = nr * COLS + nc;
                                 int weight_idx = ch * 9 + (dr + 1) * 3 + (dc + 1);
                                 sum += conv_weights(i, weight_idx) * input(ch, input_pos);
                             }
@@ -150,7 +150,6 @@ private:
     std::atomic<size_t> position{0};
     std::mutex mtx;
     float alpha = 0.6f;
-    float beta = 0.4f;
 
 public:
     void add(const Experience& exp) {
@@ -159,33 +158,39 @@ public:
             buffer.push_back(exp);
             priorities.push_back(exp.priority);
         } else {
-            buffer[position % MEMORY_CAPACITY] = exp;
-            priorities[position % MEMORY_CAPACITY] = exp.priority;
+            size_t pos = position % MEMORY_CAPACITY;
+            buffer[pos] = exp;
+            priorities[pos] = exp.priority;
         }
         position++;
     }
 
-    std::vector<Experience> sample(int batch_size) {
+    std::vector<Experience, Eigen::aligned_allocator<Experience>> sample(int batch_size) {
+        std::lock_guard<std::mutex> lock(mtx);
+        std::vector<Experience, Eigen::aligned_allocator<Experience>> batch;
+        if(buffer.empty()) return batch;
+
         std::vector<float> probs(priorities.begin(), priorities.end());
         for(auto& p : probs) p = std::pow(p, alpha);
         float sum = std::accumulate(probs.begin(), probs.end(), 0.0f);
+        if(sum == 0.0f) return batch;
         for(auto& p : probs) p /= sum;
 
         std::discrete_distribution<int> dist(probs.begin(), probs.end());
-        std::vector<Experience> batch;
         std::mt19937 gen(std::random_device{}());
-        std::lock_guard<std::mutex> lock(mtx);
         
-        for(int i=0; i<batch_size; ++i)
-            batch.push_back(buffer[dist(gen)]);
-        
+        for(int i=0; i<batch_size; ++i) {
+            int idx = dist(gen) % buffer.size();
+            batch.push_back(buffer[idx]);
+        }
         return batch;
     }
 
     void update_priorities(const std::vector<float>& new_priorities) {
         std::lock_guard<std::mutex> lock(mtx);
-        for(size_t i=0; i<new_priorities.size(); ++i)
-            priorities[i] = new_priorities[i];
+        for(size_t i=0; i<new_priorities.size(); ++i) {
+            if(i < priorities.size()) priorities[i] = new_priorities[i];
+        }
     }
 };
 
@@ -193,7 +198,8 @@ ConvNet policy_net, target_net;
 PrioritizedReplay replay_buffer;
 std::atomic<bool> training_active{true};
 std::atomic<int> global_step{0};
-std::atomic<bool> visualize_training{false};
+std::atomic<int> games_completed{0};
+std::mutex display_mutex;
 
 Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> board_to_tensor(const std::vector<std::vector<char>>& board) {
     Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> tensor;
@@ -209,44 +215,50 @@ Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> board_to_tensor(const std::vecto
 int select_action(const Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS>& state, float epsilon) {
     static thread_local std::mt19937 gen(std::random_device{}());
     std::vector<int> valid_actions;
-    for(int c=0; c<COLS; ++c)
-        if(state(0, 0*COLS + c) == 0 && state(1, 0*COLS + c) == 0)
+    for(int c=0; c<COLS; ++c) {
+        if(state(0, 0*COLS + c) == 0 && state(1, 0*COLS + c) == 0) {
             valid_actions.push_back(c);
-    
+        }
+    }
     if(valid_actions.empty()) return -1;
     
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    if(dist(gen) < epsilon)
+    if(dist(gen) < epsilon) {
         return valid_actions[gen() % valid_actions.size()];
+    }
     
     Vector q_values = policy_net.forward(state);
     int best_action = valid_actions[0];
     float best_value = q_values[best_action];
-    for(int a : valid_actions)
-        if(q_values[a] > best_value)
-            best_action = a, best_value = q_values[a];
+    for(int a : valid_actions) {
+        if(q_values[a] > best_value) {
+            best_action = a;
+            best_value = q_values[a];
+        }
+    }
     return best_action;
 }
 
 bool check_win(const std::vector<std::vector<char>>& board, char player) {
     auto check = [&](int r, int c, int dr, int dc) {
-        for(int i=0; i<4; ++i)
+        for(int i=0; i<4; ++i) {
+            if(r + i*dr < 0 || r + i*dr >= ROWS || c + i*dc < 0 || c + i*dc >= COLS) return false;
             if(board[r + i*dr][c + i*dc] != player) return false;
+        }
         return true;
     };
     
-    for(int r=0; r<ROWS; ++r)
-        for(int c=0; c<COLS-3; ++c)
-            if(check(r, c, 0, 1)) return true;
-    for(int c=0; c<COLS; ++c)
-        for(int r=0; r<ROWS-3; ++r)
-            if(check(r, c, 1, 0)) return true;
-    for(int r=0; r<ROWS-3; ++r)
-        for(int c=0; c<COLS-3; ++c)
-            if(check(r, c, 1, 1)) return true;
-    for(int r=3; r<ROWS; ++r)
-        for(int c=0; c<COLS-3; ++c)
-            if(check(r, c, -1, 1)) return true;
+    for(int r=0; r<ROWS; ++r) {
+        for(int c=0; c<COLS; ++c) {
+            if(board[r][c] == ' ') continue;
+            if((c <= COLS-4 && check(r, c, 0, 1)) ||
+               (r <= ROWS-4 && check(r, c, 1, 0)) ||
+               (r <= ROWS-4 && c <= COLS-4 && check(r, c, 1, 1)) ||
+               (r >= 3 && c <= COLS-4 && check(r, c, -1, 1))) {
+                return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -270,7 +282,7 @@ void display_board(const std::vector<std::vector<char>>& board) {
 
 void actor_thread(int thread_id, bool visualize) {
     std::vector<std::vector<char>> board(ROWS, std::vector<char>(COLS, ' '));
-    float epsilon = std::pow(0.01f, (float)thread_id/NUM_ACTORS);
+    float epsilon = std::pow(0.01f, static_cast<float>(thread_id)/NUM_ACTORS);
     
     while(training_active) {
         board = std::vector<std::vector<char>>(ROWS, std::vector<char>(COLS, ' '));
@@ -289,17 +301,19 @@ void actor_thread(int thread_id, bool visualize) {
             board[row][action] = current;
             
             if(visualize) {
+                std::lock_guard<std::mutex> lock(display_mutex);
                 system("cls");
                 display_board(board);
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
             
-            float reward = 0;
+            float reward = 0.0f;
             if(check_win(board, current)) {
                 reward = (current == 'Y') ? 1.0f : -1.0f;
                 done = true;
+            } else if(std::all_of(board[0].begin(), board[0].end(), [](char c) { return c != ' '; })) {
+                done = true;
             }
-            else if(std::all_of(board[0].begin(), board[0].end(), [](char c) { return c != ' '; })) done = true;
             
             Experience exp;
             exp.state = state_tensor;
@@ -313,20 +327,22 @@ void actor_thread(int thread_id, bool visualize) {
             current = (current == 'Y') ? 'R' : 'Y';
         }
         
-        for(auto& exp : episode)
-            replay_buffer.add(exp);
+        if(!episode.empty()) {
+            for(const auto& exp : episode) replay_buffer.add(exp);
+            games_completed++;
+        }
     }
 }
 
 void learner_thread() {
-    std::vector<Experience> batch;
-    
     while(training_active) {
-        batch = replay_buffer.sample(BATCH_SIZE);
-        std::vector<float> new_priorities;
-        new_priorities.reserve(BATCH_SIZE);
+        auto batch = replay_buffer.sample(BATCH_SIZE);
+        if(batch.empty()) continue;
         
-        for(auto& exp : batch) {
+        std::vector<float> new_priorities;
+        new_priorities.reserve(batch.size());
+        
+        for(const auto& exp : batch) {
             Vector q_current = policy_net.forward(exp.state);
             Vector q_next = target_net.forward(exp.next_state);
             
@@ -338,8 +354,9 @@ void learner_thread() {
         
         replay_buffer.update_priorities(new_priorities);
         
-        if(global_step++ % TARGET_UPDATE == 0)
+        if(global_step++ % TARGET_UPDATE == 0) {
             policy_net.soft_update(target_net, 0.01f);
+        }
     }
 }
 
@@ -358,12 +375,12 @@ void train_ai(int games) {
         learners.emplace_back(learner_thread);
     
     auto start = std::chrono::steady_clock::now();
-    while(global_step < games && training_active) {
+    while(games_completed < games && training_active) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         auto now = std::chrono::steady_clock::now();
         float elapsed = std::chrono::duration<float>(now - start).count();
-        std::cout << "Step: " << global_step << "/" << games 
-                  << " | Steps/s: " << global_step/elapsed << "\r";
+        std::cout << "Games: " << games_completed << "/" << games 
+                  << " | Games/s: " << games_completed/elapsed << "\r";
     }
     
     training_active = false;
@@ -395,10 +412,10 @@ int main() {
     std::cin >> choice;
     
     if(choice == 2) {
-        std::cout << "Training steps: ";
-        int steps;
-        std::cin >> steps;
-        train_ai(steps);
+        std::cout << "Training games: ";
+        int games;
+        std::cin >> games;
+        train_ai(games);
         return 0;
     }
     
@@ -429,9 +446,9 @@ int main() {
             int row = ROWS-1;
             while(row >=0 && board[row][move] != ' ') row--;
             board[row][move] = human;
-        }
-        else {
+        } else {
             int move = ai_move(board);
+            if(move == -1) break;
             int row = ROWS-1;
             while(row >=0 && board[row][move] != ' ') row--;
             if(row >= 0) board[row][move] = ai;
