@@ -12,6 +12,8 @@
 #include <direct.h>
 #include <iomanip>
 #include <Eigen/Dense>
+#include <unordered_map>
+#include <sstream>
 
 constexpr int ROWS = 6;
 constexpr int COLS = 7;
@@ -28,6 +30,8 @@ constexpr int NUM_LEARNERS = 2;
 constexpr int TARGET_UPDATE = 1000;
 constexpr float INITIAL_EPSILON = 0.15f;
 constexpr float MIN_EPSILON = 0.01f;
+constexpr int MAX_DEPTH = 8;
+constexpr int TIME_LIMIT_MS = 1000;
 
 using Matrix = Eigen::MatrixXf;
 using Vector = Eigen::VectorXf;
@@ -40,6 +44,12 @@ struct Experience {
     Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> next_state;
     bool done;
     float priority;
+};
+
+struct TranspositionEntry {
+    int depth;
+    float value;
+    int move;
 };
 
 class ConvNet {
@@ -214,6 +224,134 @@ PrioritizedReplay replay_buffer;
 std::atomic<bool> training_active{true};
 std::atomic<int> games_completed{0};
 std::mutex display_mutex;
+std::unordered_map<std::string, TranspositionEntry> transposition_table;
+
+std::string board_to_hash(const std::vector<std::vector<char>>& board) {
+    std::stringstream ss;
+    for(const auto& row : board)
+        for(char c : row)
+            ss << c;
+    return ss.str();
+}
+
+int evaluate_window(const std::array<char, 4>& window, char player) {
+    int score = 0;
+    int count = std::count(window.begin(), window.end(), player);
+    int empty = std::count(window.begin(), window.end(), ' ');
+    int opp_count = 4 - count - empty;
+    
+    if(count == 4) score += 100;
+    else if(count == 3 && empty == 1) score += 5;
+    else if(count == 2 && empty == 2) score += 2;
+    if(opp_count == 3 && empty == 1) score -= 4;
+    return score;
+}
+
+int evaluate_board(const std::vector<std::vector<char>>& board, char player) {
+    int score = 0;
+    char opponent = (player == 'R') ? 'Y' : 'R';
+    
+    for(int r=0; r<ROWS; ++r) {
+        for(int c=0; c<COLS-3; ++c) {
+            std::array<char,4> window = {board[r][c], board[r][c+1], board[r][c+2], board[r][c+3]};
+            score += evaluate_window(window, player);
+        }
+    }
+    
+    for(int c=0; c<COLS; ++c) {
+        for(int r=0; r<ROWS-3; ++r) {
+            std::array<char,4> window = {board[r][c], board[r+1][c], board[r+2][c], board[r+3][c]};
+            score += evaluate_window(window, player);
+        }
+    }
+    
+    for(int r=0; r<ROWS-3; ++r) {
+        for(int c=0; c<COLS-3; ++c) {
+            std::array<char,4> window = {board[r][c], board[r+1][c+1], board[r+2][c+2], board[r+3][c+3]};
+            score += evaluate_window(window, player);
+        }
+    }
+    
+    for(int r=3; r<ROWS; ++r) {
+        for(int c=0; c<COLS-3; ++c) {
+            std::array<char,4> window = {board[r][c], board[r-1][c+1], board[r-2][c+2], board[r-3][c+3]};
+            score += evaluate_window(window, player);
+        }
+    }
+    return score;
+}
+
+std::vector<int> get_valid_moves(const std::vector<std::vector<char>>& board) {
+    std::vector<int> moves;
+    for(int c=0; c<COLS; ++c)
+        if(board[0][c] == ' ')
+            moves.push_back(c);
+    return moves;
+}
+
+int alpha_beta(std::vector<std::vector<char>>& board, int depth, int alpha, int beta, bool maximizing, char player, 
+               auto start_time, int current_depth, int& best_move) {
+    if(depth == 0 || std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time).count() > TIME_LIMIT_MS)
+        return evaluate_board(board, player);
+    
+    std::string hash = board_to_hash(board);
+    if(transposition_table.count(hash) && transposition_table[hash].depth >= depth)
+        return transposition_table[hash].value;
+    
+    auto moves = get_valid_moves(board);
+    if(moves.empty()) return 0;
+    
+    if(maximizing) {
+        int max_eval = INT_MIN;
+        for(int move : moves) {
+            int row = ROWS-1;
+            while(row >=0 && board[row][move] != ' ') row--;
+            board[row][move] = player;
+            int eval = alpha_beta(board, depth-1, alpha, beta, false, player, start_time, current_depth, best_move);
+            board[row][move] = ' ';
+            
+            if(eval > max_eval) {
+                max_eval = eval;
+                if(current_depth == depth) best_move = move;
+            }
+            alpha = std::max(alpha, eval);
+            if(beta <= alpha) break;
+        }
+        transposition_table[hash] = {depth, max_eval, best_move};
+        return max_eval;
+    } else {
+        int min_eval = INT_MAX;
+        for(int move : moves) {
+            int row = ROWS-1;
+            while(row >=0 && board[row][move] != ' ') row--;
+            board[row][move] = (player == 'R') ? 'Y' : 'R';
+            int eval = alpha_beta(board, depth-1, alpha, beta, true, player, start_time, current_depth, best_move);
+            board[row][move] = ' ';
+            
+            if(eval < min_eval) {
+                min_eval = eval;
+                if(current_depth == depth) best_move = move;
+            }
+            beta = std::min(beta, eval);
+            if(beta <= alpha) break;
+        }
+        transposition_table[hash] = {depth, min_eval, best_move};
+        return min_eval;
+    }
+}
+
+int iterative_deepening(std::vector<std::vector<char>> board, char player) {
+    auto start = std::chrono::steady_clock::now();
+    int best_move = -1;
+    for(int depth=1; depth<=MAX_DEPTH; ++depth) {
+        int current_move = -1;
+        alpha_beta(board, depth, INT_MIN, INT_MAX, true, player, start, depth, current_move);
+        if(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() > TIME_LIMIT_MS)
+            break;
+        if(current_move != -1) best_move = current_move;
+    }
+    return best_move;
+}
 
 Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> board_to_tensor(const std::vector<std::vector<char>>& board) {
     Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> tensor;
@@ -226,14 +364,9 @@ Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> board_to_tensor(const std::vecto
     return tensor;
 }
 
-int select_action(const Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS>& state, float epsilon) {
+int select_action(const Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS>& state, float epsilon, const std::vector<std::vector<char>>& board) {
     static thread_local std::mt19937 gen(std::random_device{}());
-    std::vector<int> valid_actions;
-    for(int c=0; c<COLS; ++c) {
-        if(state(0, 0*COLS + c) == 0 && state(1, 0*COLS + c) == 0) {
-            valid_actions.push_back(c);
-        }
-    }
+    std::vector<int> valid_actions = get_valid_moves(board);
     if(valid_actions.empty()) return -1;
     
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
@@ -241,16 +374,19 @@ int select_action(const Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS>& state, 
         return valid_actions[gen() % valid_actions.size()];
     }
     
-    Vector q_values = policy_net.forward(state);
-    int best_action = valid_actions[0];
-    float best_value = q_values[best_action];
-    for(int a : valid_actions) {
-        if(q_values[a] > best_value) {
-            best_action = a;
-            best_value = q_values[a];
+    if(std::ifstream("memory/policy.bin")) {
+        Vector q_values = policy_net.forward(state);
+        int best_action = valid_actions[0];
+        float best_value = q_values[best_action];
+        for(int a : valid_actions) {
+            if(q_values[a] > best_value) {
+                best_action = a;
+                best_value = q_values[a];
+            }
         }
+        return best_action;
     }
-    return best_action;
+    return iterative_deepening(board, 'Y');
 }
 
 bool check_win(const std::vector<std::vector<char>>& board, char player) {
@@ -267,10 +403,8 @@ bool check_win(const std::vector<std::vector<char>>& board, char player) {
     for(int r=0; r<ROWS; ++r) {
         for(int c=0; c<COLS; ++c) {
             if(board[r][c] == player) {
-                if(check(r, c, 0, 1) || check(r, c, 1, 0) || 
-                   check(r, c, 1, 1) || check(r, c, -1, 1)) {
+                if(check(r, c, 0, 1) || check(r, c, 1, 0) || check(r, c, 1, 1) || check(r, c, -1, 1))
                     return true;
-                }
             }
         }
     }
@@ -304,18 +438,16 @@ void actor_thread(int thread_id, bool visualize) {
         char current = 'Y';
         std::vector<Experience> episode;
         bool done = false;
-        int moves = 0;
         
         while(!done && training_active) {
             auto state_tensor = board_to_tensor(board);
-            int action = select_action(state_tensor, epsilon);
+            int action = select_action(state_tensor, epsilon, board);
             
             if(action == -1) break;
             int row = ROWS-1;
             while(row >=0 && board[row][action] != ' ') row--;
             if(row < 0) break;
             board[row][action] = current;
-            moves++;
 
             float reward = 0.0f;
             if(check_win(board, current)) {
@@ -325,7 +457,7 @@ void actor_thread(int thread_id, bool visualize) {
                 done = true;
             }
 
-            if(visualize && moves % 2 == 0) {
+            if(visualize) {
                 std::lock_guard<std::mutex> lock(display_mutex);
                 system("cls");
                 std::cout << "Training Games: " << games_completed << "\n";
@@ -410,19 +542,20 @@ void train_ai(int total_games) {
 }
 
 int ai_move(const std::vector<std::vector<char>>& board) {
-    auto state = board_to_tensor(board);
-    Vector q_values = policy_net.forward(state);
-    
-    std::vector<std::pair<float, int>> action_scores;
-    for(int c=0; c<COLS; ++c) {
-        if(board[0][c] == ' ') {
-            action_scores.emplace_back(q_values[c], c);
+    if(std::ifstream("memory/policy.bin")) {
+        auto state = board_to_tensor(board);
+        Vector q_values = policy_net.forward(state);
+        std::vector<std::pair<float, int>> action_scores;
+        for(int c=0; c<COLS; ++c) {
+            if(board[0][c] == ' ') {
+                action_scores.emplace_back(q_values[c], c);
+            }
         }
+        if(action_scores.empty()) return -1;
+        std::sort(action_scores.rbegin(), action_scores.rend());
+        return action_scores[0].second;
     }
-    
-    if(action_scores.empty()) return -1;
-    std::sort(action_scores.rbegin(), action_scores.rend());
-    return action_scores[0].second;
+    return iterative_deepening(board, 'Y');
 }
 
 int main() {
