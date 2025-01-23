@@ -26,6 +26,8 @@ constexpr int MEMORY_CAPACITY = 2000000;
 constexpr int NUM_ACTORS = 8;
 constexpr int NUM_LEARNERS = 2;
 constexpr int TARGET_UPDATE = 1000;
+constexpr float INITIAL_EPSILON = 0.15f;
+constexpr float MIN_EPSILON = 0.01f;
 
 using Matrix = Eigen::MatrixXf;
 using Vector = Eigen::VectorXf;
@@ -48,19 +50,23 @@ public:
     Vector fc1_biases;
     Matrix fc2_weights;
     Vector fc2_biases;
-    Matrix fc3_weights;
-    Vector fc3_biases;
+    Matrix fc3_advantage_weights;
+    Vector fc3_advantage_biases;
+    Matrix fc3_value_weights;
+    Vector fc3_value_biases;
     
     ConvNet() : 
         fc1_weights(HIDDEN_SIZE, CONV_FILTERS*ROWS*COLS),
         fc1_biases(HIDDEN_SIZE),
         fc2_weights(HIDDEN_SIZE, HIDDEN_SIZE),
         fc2_biases(HIDDEN_SIZE),
-        fc3_weights(OUTPUT_SIZE, HIDDEN_SIZE),
-        fc3_biases(OUTPUT_SIZE) {
+        fc3_advantage_weights(OUTPUT_SIZE, HIDDEN_SIZE),
+        fc3_advantage_biases(OUTPUT_SIZE),
+        fc3_value_weights(1, HIDDEN_SIZE),
+        fc3_value_biases(1) {
         
         std::mt19937 gen(42);
-        std::normal_distribution<float> dist(0.0f, 0.02f);
+        std::normal_distribution<float> dist(0.0f, 0.01f);
         
         auto init = [&](auto& m) { m = m.unaryExpr([&](auto x) { return dist(gen); }); };
         init(conv_weights);
@@ -69,8 +75,10 @@ public:
         init(fc1_biases);
         init(fc2_weights);
         init(fc2_biases);
-        init(fc3_weights);
-        init(fc3_biases);
+        init(fc3_advantage_weights);
+        init(fc3_advantage_biases);
+        init(fc3_value_weights);
+        init(fc3_value_biases);
     }
 
     Vector forward(const Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS>& input) const {
@@ -102,7 +110,11 @@ public:
         Eigen::Map<const Vector> flat_conv(conv_out.data(), conv_out.size());
         Vector fc1 = (fc1_weights * flat_conv).cwiseMax(0.0f) + fc1_biases;
         Vector fc2 = (fc2_weights * fc1).cwiseMax(0.0f) + fc2_biases;
-        return fc3_weights * fc2 + fc3_biases;
+        
+        Vector advantage = (fc3_advantage_weights * fc2) + fc3_advantage_biases;
+        float value = (fc3_value_weights * fc2 + fc3_value_biases)(0);
+        float mean_advantage = advantage.mean();
+        return advantage.array() + value - mean_advantage;
     }
 
     void soft_update(const ConvNet& target, float tau) {
@@ -112,8 +124,10 @@ public:
         fc1_biases = tau * target.fc1_biases + (1 - tau) * fc1_biases;
         fc2_weights = tau * target.fc2_weights + (1 - tau) * fc2_weights;
         fc2_biases = tau * target.fc2_biases + (1 - tau) * fc2_biases;
-        fc3_weights = tau * target.fc3_weights + (1 - tau) * fc3_weights;
-        fc3_biases = tau * target.fc3_biases + (1 - tau) * fc3_biases;
+        fc3_advantage_weights = tau * target.fc3_advantage_weights + (1 - tau) * fc3_advantage_weights;
+        fc3_advantage_biases = tau * target.fc3_advantage_biases + (1 - tau) * fc3_advantage_biases;
+        fc3_value_weights = tau * target.fc3_value_weights + (1 - tau) * fc3_value_weights;
+        fc3_value_biases = tau * target.fc3_value_biases + (1 - tau) * fc3_value_biases;
     }
 
     void save(const std::string& path) {
@@ -124,8 +138,10 @@ public:
         file.write(reinterpret_cast<const char*>(fc1_biases.data()), fc1_biases.size() * sizeof(float));
         file.write(reinterpret_cast<const char*>(fc2_weights.data()), fc2_weights.size() * sizeof(float));
         file.write(reinterpret_cast<const char*>(fc2_biases.data()), fc2_biases.size() * sizeof(float));
-        file.write(reinterpret_cast<const char*>(fc3_weights.data()), fc3_weights.size() * sizeof(float));
-        file.write(reinterpret_cast<const char*>(fc3_biases.data()), fc3_biases.size() * sizeof(float));
+        file.write(reinterpret_cast<const char*>(fc3_advantage_weights.data()), fc3_advantage_weights.size() * sizeof(float));
+        file.write(reinterpret_cast<const char*>(fc3_advantage_biases.data()), fc3_advantage_biases.size() * sizeof(float));
+        file.write(reinterpret_cast<const char*>(fc3_value_weights.data()), fc3_value_weights.size() * sizeof(float));
+        file.write(reinterpret_cast<const char*>(fc3_value_biases.data()), fc3_value_biases.size() * sizeof(float));
     }
 
     void load(const std::string& path) {
@@ -136,8 +152,10 @@ public:
         file.read(reinterpret_cast<char*>(fc1_biases.data()), fc1_biases.size() * sizeof(float));
         file.read(reinterpret_cast<char*>(fc2_weights.data()), fc2_weights.size() * sizeof(float));
         file.read(reinterpret_cast<char*>(fc2_biases.data()), fc2_biases.size() * sizeof(float));
-        file.read(reinterpret_cast<char*>(fc3_weights.data()), fc3_weights.size() * sizeof(float));
-        file.read(reinterpret_cast<char*>(fc3_biases.data()), fc3_biases.size() * sizeof(float));
+        file.read(reinterpret_cast<char*>(fc3_advantage_weights.data()), fc3_advantage_weights.size() * sizeof(float));
+        file.read(reinterpret_cast<char*>(fc3_advantage_biases.data()), fc3_advantage_biases.size() * sizeof(float));
+        file.read(reinterpret_cast<char*>(fc3_value_weights.data()), fc3_value_weights.size() * sizeof(float));
+        file.read(reinterpret_cast<char*>(fc3_value_biases.data()), fc3_value_biases.size() * sizeof(float));
     }
 };
 
@@ -279,13 +297,14 @@ void display_board(const std::vector<std::vector<char>>& board) {
 
 void actor_thread(int thread_id, bool visualize) {
     std::vector<std::vector<char>> board(ROWS, std::vector<char>(COLS, ' '));
-    float epsilon = std::pow(0.01f, static_cast<float>(thread_id)/NUM_ACTORS);
     
     while(training_active) {
+        float epsilon = std::max(INITIAL_EPSILON * std::pow(0.85f, games_completed/1000.0f), MIN_EPSILON);
         board = std::vector<std::vector<char>>(ROWS, std::vector<char>(COLS, ' '));
         char current = 'Y';
         std::vector<Experience> episode;
         bool done = false;
+        int moves = 0;
         
         while(!done && training_active) {
             auto state_tensor = board_to_tensor(board);
@@ -296,21 +315,22 @@ void actor_thread(int thread_id, bool visualize) {
             while(row >=0 && board[row][action] != ' ') row--;
             if(row < 0) break;
             board[row][action] = current;
-            
-            if(visualize) {
-                std::lock_guard<std::mutex> lock(display_mutex);
-                system("cls");
-                std::cout << "Training Games Completed: " << games_completed << "\n";
-                display_board(board);
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
-            
+            moves++;
+
             float reward = 0.0f;
             if(check_win(board, current)) {
                 reward = (current == 'Y') ? 1.0f : -1.0f;
                 done = true;
             } else if(std::all_of(board[0].begin(), board[0].end(), [](char c) { return c != ' '; })) {
                 done = true;
+            }
+
+            if(visualize && moves % 2 == 0) {
+                std::lock_guard<std::mutex> lock(display_mutex);
+                system("cls");
+                std::cout << "Training Games: " << games_completed << "\n";
+                display_board(board);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
             
             episode.emplace_back(Experience{state_tensor, action, reward, 
@@ -326,6 +346,7 @@ void actor_thread(int thread_id, bool visualize) {
 }
 
 void learner_thread() {
+    int update_counter = 0;
     while(training_active) {
         auto batch = replay_buffer.sample(BATCH_SIZE);
         if(batch.empty()) continue;
@@ -345,9 +366,8 @@ void learner_thread() {
         
         replay_buffer.update_priorities(new_priorities);
         
-        static std::atomic<int> update_counter{0};
         if(++update_counter % TARGET_UPDATE == 0) {
-            policy_net.soft_update(target_net, 0.01f);
+            policy_net.soft_update(target_net, 0.05f);
         }
     }
 }
@@ -386,21 +406,23 @@ void train_ai(int total_games) {
     
     policy_net.save("memory/policy.bin");
     target_net.save("memory/target.bin");
-    std::cout << "\nTraining complete. Games played: " << games_completed << "\n";
+    std::cout << "\nTraining complete. Total games: " << games_completed << "\n";
 }
 
 int ai_move(const std::vector<std::vector<char>>& board) {
     auto state = board_to_tensor(board);
-    int move = select_action(state, 0.0f);
-    if(move == -1 || board[0][move] != ' ') {
-        for(int c=0; c<COLS; ++c) {
-            if(board[0][c] == ' ') {
-                move = c;
-                break;
-            }
+    Vector q_values = policy_net.forward(state);
+    
+    std::vector<std::pair<float, int>> action_scores;
+    for(int c=0; c<COLS; ++c) {
+        if(board[0][c] == ' ') {
+            action_scores.emplace_back(q_values[c], c);
         }
     }
-    return move;
+    
+    if(action_scores.empty()) return -1;
+    std::sort(action_scores.rbegin(), action_scores.rend());
+    return action_scores[0].second;
 }
 
 int main() {
@@ -445,6 +467,7 @@ int main() {
             board[row][move] = human;
         } else {
             int move = ai_move(board);
+            if(move == -1) break;
             int row = ROWS-1;
             while(row >=0 && board[row][move] != ' ') row--;
             if(row >= 0) board[row][move] = ai;
