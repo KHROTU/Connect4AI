@@ -12,7 +12,6 @@
 #include <direct.h>
 #include <iomanip>
 #include <Eigen/Dense>
-#include <deque>
 
 constexpr int ROWS = 6;
 constexpr int COLS = 7;
@@ -96,7 +95,6 @@ public:
                         }
                     }
                 }
-                
                 conv_out(i, pos) = std::max(sum + conv_biases[i], 0.0f);
             }
         }
@@ -173,23 +171,22 @@ public:
         std::vector<float> probs(priorities.begin(), priorities.end());
         for(auto& p : probs) p = std::pow(p, alpha);
         float sum = std::accumulate(probs.begin(), probs.end(), 0.0f);
-        if(sum == 0.0f) return batch;
+        if(sum <= 0.0f) return batch;
         for(auto& p : probs) p /= sum;
 
         std::discrete_distribution<int> dist(probs.begin(), probs.end());
         std::mt19937 gen(std::random_device{}());
         
-        for(int i=0; i<batch_size; ++i) {
-            int idx = dist(gen) % buffer.size();
-            batch.push_back(buffer[idx]);
+        for(int i=0; i<batch_size && i<buffer.size(); ++i) {
+            batch.push_back(buffer[dist(gen) % buffer.size()]);
         }
         return batch;
     }
 
     void update_priorities(const std::vector<float>& new_priorities) {
         std::lock_guard<std::mutex> lock(mtx);
-        for(size_t i=0; i<new_priorities.size(); ++i) {
-            if(i < priorities.size()) priorities[i] = new_priorities[i];
+        for(size_t i=0; i<new_priorities.size() && i<priorities.size(); ++i) {
+            priorities[i] = new_priorities[i];
         }
     }
 };
@@ -197,7 +194,6 @@ public:
 ConvNet policy_net, target_net;
 PrioritizedReplay replay_buffer;
 std::atomic<bool> training_active{true};
-std::atomic<int> global_step{0};
 std::atomic<int> games_completed{0};
 std::mutex display_mutex;
 
@@ -242,20 +238,21 @@ int select_action(const Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS>& state, 
 bool check_win(const std::vector<std::vector<char>>& board, char player) {
     auto check = [&](int r, int c, int dr, int dc) {
         for(int i=0; i<4; ++i) {
-            if(r + i*dr < 0 || r + i*dr >= ROWS || c + i*dc < 0 || c + i*dc >= COLS) return false;
-            if(board[r + i*dr][c + i*dc] != player) return false;
+            int nr = r + i*dr;
+            int nc = c + i*dc;
+            if(nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) return false;
+            if(board[nr][nc] != player) return false;
         }
         return true;
     };
     
     for(int r=0; r<ROWS; ++r) {
         for(int c=0; c<COLS; ++c) {
-            if(board[r][c] == ' ') continue;
-            if((c <= COLS-4 && check(r, c, 0, 1)) ||
-               (r <= ROWS-4 && check(r, c, 1, 0)) ||
-               (r <= ROWS-4 && c <= COLS-4 && check(r, c, 1, 1)) ||
-               (r >= 3 && c <= COLS-4 && check(r, c, -1, 1))) {
-                return true;
+            if(board[r][c] == player) {
+                if(check(r, c, 0, 1) || check(r, c, 1, 0) || 
+                   check(r, c, 1, 1) || check(r, c, -1, 1)) {
+                    return true;
+                }
             }
         }
     }
@@ -303,6 +300,7 @@ void actor_thread(int thread_id, bool visualize) {
             if(visualize) {
                 std::lock_guard<std::mutex> lock(display_mutex);
                 system("cls");
+                std::cout << "Training Games Completed: " << games_completed << "\n";
                 display_board(board);
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
@@ -315,15 +313,8 @@ void actor_thread(int thread_id, bool visualize) {
                 done = true;
             }
             
-            Experience exp;
-            exp.state = state_tensor;
-            exp.action = action;
-            exp.reward = reward;
-            exp.next_state = board_to_tensor(board);
-            exp.done = done;
-            exp.priority = 1.0f;
-            
-            episode.push_back(exp);
+            episode.emplace_back(Experience{state_tensor, action, reward, 
+                                          board_to_tensor(board), done, 1.0f});
             current = (current == 'Y') ? 'R' : 'Y';
         }
         
@@ -354,13 +345,14 @@ void learner_thread() {
         
         replay_buffer.update_priorities(new_priorities);
         
-        if(global_step++ % TARGET_UPDATE == 0) {
+        static std::atomic<int> update_counter{0};
+        if(++update_counter % TARGET_UPDATE == 0) {
             policy_net.soft_update(target_net, 0.01f);
         }
     }
 }
 
-void train_ai(int games) {
+void train_ai(int total_games) {
     _mkdir("memory");
     std::vector<std::thread> actors;
     std::vector<std::thread> learners;
@@ -375,12 +367,17 @@ void train_ai(int games) {
         learners.emplace_back(learner_thread);
     
     auto start = std::chrono::steady_clock::now();
-    while(games_completed < games && training_active) {
+    while(games_completed < total_games && training_active) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         auto now = std::chrono::steady_clock::now();
         float elapsed = std::chrono::duration<float>(now - start).count();
-        std::cout << "Games: " << games_completed << "/" << games 
-                  << " | Games/s: " << games_completed/elapsed << "\r";
+        
+        if(!visualize) {
+            std::cout << "Progress: " << games_completed << "/" << total_games 
+                      << " (" << std::fixed << std::setprecision(1) 
+                      << (games_completed*100.0f/total_games) << "%)"
+                      << " | Games/s: " << games_completed/elapsed << "\r";
+        }
     }
     
     training_active = false;
@@ -389,7 +386,7 @@ void train_ai(int games) {
     
     policy_net.save("memory/policy.bin");
     target_net.save("memory/target.bin");
-    std::cout << "\nTraining complete.\n";
+    std::cout << "\nTraining complete. Games played: " << games_completed << "\n";
 }
 
 int ai_move(const std::vector<std::vector<char>>& board) {
@@ -412,7 +409,7 @@ int main() {
     std::cin >> choice;
     
     if(choice == 2) {
-        std::cout << "Training games: ";
+        std::cout << "Enter total training games: ";
         int games;
         std::cin >> games;
         train_ai(games);
@@ -448,7 +445,6 @@ int main() {
             board[row][move] = human;
         } else {
             int move = ai_move(board);
-            if(move == -1) break;
             int row = ROWS-1;
             while(row >=0 && board[row][move] != ' ') row--;
             if(row >= 0) board[row][move] = ai;
