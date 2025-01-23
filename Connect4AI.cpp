@@ -30,8 +30,8 @@ constexpr int NUM_LEARNERS = 2;
 constexpr int TARGET_UPDATE = 1000;
 constexpr float INITIAL_EPSILON = 0.15f;
 constexpr float MIN_EPSILON = 0.01f;
-constexpr int MAX_DEPTH = 8;
-constexpr int TIME_LIMIT_MS = 1000;
+constexpr int MAX_DEPTH = 7;
+constexpr int TIME_LIMIT_MS = 150;
 
 using Matrix = Eigen::MatrixXf;
 using Vector = Eigen::VectorXf;
@@ -48,7 +48,7 @@ struct Experience {
 
 struct TranspositionEntry {
     int depth;
-    float value;
+    int value;
     int move;
 };
 
@@ -240,10 +240,11 @@ int evaluate_window(const std::array<char, 4>& window, char player) {
     int empty = std::count(window.begin(), window.end(), ' ');
     int opp_count = 4 - count - empty;
     
-    if(count == 4) score += 100;
-    else if(count == 3 && empty == 1) score += 5;
-    else if(count == 2 && empty == 2) score += 2;
-    if(opp_count == 3 && empty == 1) score -= 4;
+    if(count == 4) return 10000;
+    if(count == 3 && empty == 1) score += 500;
+    if(count == 2 && empty == 2) score += 20;
+    if(opp_count == 3 && empty == 1) score -= 1000;
+    if(opp_count == 2 && empty == 2) score -= 50;
     return score;
 }
 
@@ -278,6 +279,12 @@ int evaluate_board(const std::vector<std::vector<char>>& board, char player) {
             score += evaluate_window(window, player);
         }
     }
+    
+    int center_count = 0;
+    for(int r=0; r<ROWS; ++r)
+        center_count += (board[r][COLS/2] == player);
+    score += center_count * 30;
+    
     return score;
 }
 
@@ -290,7 +297,7 @@ std::vector<int> get_valid_moves(const std::vector<std::vector<char>>& board) {
 }
 
 int alpha_beta(std::vector<std::vector<char>>& board, int depth, int alpha, int beta, bool maximizing, char player, 
-               auto start_time, int current_depth, int& best_move) {
+               std::chrono::steady_clock::time_point start_time, int current_depth, int& best_move) {
     if(depth == 0 || std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time).count() > TIME_LIMIT_MS)
         return evaluate_board(board, player);
     
@@ -301,9 +308,20 @@ int alpha_beta(std::vector<std::vector<char>>& board, int depth, int alpha, int 
     auto moves = get_valid_moves(board);
     if(moves.empty()) return 0;
     
+    std::vector<std::pair<int, int>> move_scores;
+    for(int move : moves) {
+        int row = ROWS-1;
+        while(row >=0 && board[row][move] != ' ') row--;
+        board[row][move] = maximizing ? player : (player == 'R' ? 'Y' : 'R');
+        move_scores.emplace_back(evaluate_board(board, player), move);
+        board[row][move] = ' ';
+    }
+    
+    std::sort(move_scores.rbegin(), move_scores.rend());
+
     if(maximizing) {
         int max_eval = INT_MIN;
-        for(int move : moves) {
+        for(auto& [score, move] : move_scores) {
             int row = ROWS-1;
             while(row >=0 && board[row][move] != ' ') row--;
             board[row][move] = player;
@@ -321,7 +339,7 @@ int alpha_beta(std::vector<std::vector<char>>& board, int depth, int alpha, int 
         return max_eval;
     } else {
         int min_eval = INT_MAX;
-        for(int move : moves) {
+        for(auto& [score, move] : move_scores) {
             int row = ROWS-1;
             while(row >=0 && board[row][move] != ' ') row--;
             board[row][move] = (player == 'R') ? 'Y' : 'R';
@@ -374,19 +392,22 @@ int select_action(const Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS>& state, 
         return valid_actions[gen() % valid_actions.size()];
     }
     
-    if(std::ifstream("memory/policy.bin")) {
-        Vector q_values = policy_net.forward(state);
-        int best_action = valid_actions[0];
-        float best_value = q_values[best_action];
-        for(int a : valid_actions) {
-            if(q_values[a] > best_value) {
-                best_action = a;
-                best_value = q_values[a];
-            }
-        }
-        return best_action;
+    bool use_minimax = (games_completed < 5000) || (dist(gen) < 0.3f);
+    if(use_minimax) {
+        int mm_move = iterative_deepening(board, 'Y');
+        if(mm_move != -1) return mm_move;
     }
-    return iterative_deepening(board, 'Y');
+    
+    Vector q_values = policy_net.forward(state);
+    int best_action = valid_actions[0];
+    float best_value = q_values[best_action];
+    for(int a : valid_actions) {
+        if(q_values[a] > best_value) {
+            best_action = a;
+            best_value = q_values[a];
+        }
+    }
+    return best_action;
 }
 
 bool check_win(const std::vector<std::vector<char>>& board, char player) {
@@ -551,7 +572,7 @@ int ai_move(const std::vector<std::vector<char>>& board) {
                 action_scores.emplace_back(q_values[c], c);
             }
         }
-        if(action_scores.empty()) return -1;
+        if(action_scores.empty()) return iterative_deepening(board, 'Y');
         std::sort(action_scores.rbegin(), action_scores.rend());
         return action_scores[0].second;
     }
