@@ -1,253 +1,220 @@
 #define NOMINMAX
 #include <iostream>
 #include <vector>
-#include <unordered_map>
+#include <atomic>
+#include <thread>
+#include <mutex>
 #include <windows.h>
-#include <limits>
 #include <algorithm>
 #include <chrono>
 #include <random>
-#include <bitset>
 #include <fstream>
 #include <direct.h>
-#include <numeric>
 #include <iomanip>
+#include <Eigen/Dense>
+#include <deque>
 
-const int ROWS = 6;
-const int COLS = 7;
-const int INPUT_SIZE = ROWS * COLS * 2;
-const int HIDDEN_SIZE = 256;
-const int OUTPUT_SIZE = COLS;
-const double LEARNING_RATE = 0.0005;
-const double GAMMA = 0.97;
-const int BATCH_SIZE = 256;
-const int MEMORY_CAPACITY = 1000000;
-const int TARGET_UPDATE = 50;
-const double EPS_START = 1.0;
-const double EPS_END = 0.01;
-const double EPS_DECAY = 0.9997;
-const double TAU = 0.005;
+constexpr int ROWS = 6;
+constexpr int COLS = 7;
+constexpr int INPUT_CHANNELS = 2;
+constexpr int CONV_FILTERS = 64;
+constexpr int HIDDEN_SIZE = 256;
+constexpr int OUTPUT_SIZE = COLS;
+constexpr float LEARNING_RATE = 0.0003f;
+constexpr float GAMMA = 0.99f;
+constexpr int BATCH_SIZE = 2048;
+constexpr int MEMORY_CAPACITY = 2000000;
+constexpr int NUM_ACTORS = 8;
+constexpr int NUM_LEARNERS = 2;
+constexpr int TARGET_UPDATE = 1000;
+
+using Matrix = Eigen::MatrixXf;
+using Vector = Eigen::VectorXf;
 
 struct Experience {
-    std::bitset<INPUT_SIZE> state;
+    Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> state;
     int action;
-    double reward;
-    std::bitset<INPUT_SIZE> next_state;
+    float reward;
+    Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> next_state;
     bool done;
+    float priority;
 };
 
-struct NeuralNetwork {
-    double W1[INPUT_SIZE][HIDDEN_SIZE];
-    double b1[HIDDEN_SIZE];
-    double W2[HIDDEN_SIZE][HIDDEN_SIZE];
-    double b2[HIDDEN_SIZE];
-    double W3[HIDDEN_SIZE][OUTPUT_SIZE];
-    double b3[OUTPUT_SIZE];
+class ConvNet {
+public:
+    Eigen::Matrix<float, CONV_FILTERS, INPUT_CHANNELS*3*3> conv_weights;
+    Eigen::Matrix<float, CONV_FILTERS, 1> conv_biases;
+    Matrix fc1_weights;
+    Vector fc1_biases;
+    Matrix fc2_weights;
+    Vector fc2_biases;
+    Matrix fc3_weights;
+    Vector fc3_biases;
     
-    NeuralNetwork() {
+    ConvNet() : 
+        fc1_weights(HIDDEN_SIZE, CONV_FILTERS*ROWS*COLS),
+        fc1_biases(HIDDEN_SIZE),
+        fc2_weights(HIDDEN_SIZE, HIDDEN_SIZE),
+        fc2_biases(HIDDEN_SIZE),
+        fc3_weights(OUTPUT_SIZE, HIDDEN_SIZE),
+        fc3_biases(OUTPUT_SIZE) {
+        
         std::mt19937 gen(42);
-        std::normal_distribution<double> dist(0.0, 0.1);
+        std::normal_distribution<float> dist(0.0f, 0.02f);
         
-        auto init_weights = [&](auto& arr, int size1, int size2) {
-            for(int i=0; i<size1; ++i)
-                for(int j=0; j<size2; ++j)
-                    arr[i][j] = dist(gen);
-        };
-        
-        init_weights(W1, INPUT_SIZE, HIDDEN_SIZE);
-        init_weights(W2, HIDDEN_SIZE, HIDDEN_SIZE);
-        init_weights(W3, HIDDEN_SIZE, OUTPUT_SIZE);
-        std::fill(b1, b1+HIDDEN_SIZE, 0.0);
-        std::fill(b2, b2+HIDDEN_SIZE, 0.0);
-        std::fill(b3, b3+OUTPUT_SIZE, 0.0);
+        auto init = [&](auto& m) { m = m.unaryExpr([&](auto){return dist(gen);}); };
+        init(conv_weights);
+        init(conv_biases);
+        init(fc1_weights);
+        init(fc1_biases);
+        init(fc2_weights);
+        init(fc2_biases);
+        init(fc3_weights);
+        init(fc3_biases);
     }
 
-    double relu(double x) const { return x > 0 ? x : 0; }
+    Vector forward(const Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS>& input) const {
+        constexpr int CONV_SIZE = ROWS*COLS;
+        Eigen::Matrix<float, CONV_FILTERS, CONV_SIZE> conv_out;
+        
+        for(int i = 0; i < CONV_FILTERS; ++i) {
+            for(int j = 0; j < CONV_SIZE; ++j) {
+                float sum = 0.0f;
+                for(int k = 0; k < INPUT_CHANNELS*3*3; ++k) {
+                    sum += conv_weights(i, k) * input(k % INPUT_CHANNELS, j);
+                }
+                conv_out(i, j) = std::max(sum + conv_biases[i], 0.0f);
+            }
+        }
 
-    std::vector<double> forward(const std::bitset<INPUT_SIZE>& input) const {
-        double h1[HIDDEN_SIZE] = {0};
-        for(int j=0; j<HIDDEN_SIZE; ++j) {
-            for(int i=0; i<INPUT_SIZE; ++i)
-                h1[j] += input[i] * W1[i][j];
-            h1[j] = relu(h1[j] + b1[j]);
-        }
-        
-        double h2[HIDDEN_SIZE] = {0};
-        for(int j=0; j<HIDDEN_SIZE; ++j) {
-            for(int i=0; i<HIDDEN_SIZE; ++i)
-                h2[j] += h1[i] * W2[i][j];
-            h2[j] = relu(h2[j] + b2[j]);
-        }
-        
-        std::vector<double> output(OUTPUT_SIZE);
-        for(int j=0; j<OUTPUT_SIZE; ++j) {
-            for(int i=0; i<HIDDEN_SIZE; ++i)
-                output[j] += h2[i] * W3[i][j];
-            output[j] += b3[j];
-        }
-        return output;
+        Eigen::Map<const Vector> flat_conv(conv_out.data(), conv_out.size());
+        Vector fc1 = (fc1_weights * flat_conv).cwiseMax(0.0f) + fc1_biases;
+        Vector fc2 = (fc2_weights * fc1).cwiseMax(0.0f) + fc2_biases;
+        return fc3_weights * fc2 + fc3_biases;
     }
 
-    void soft_update(const NeuralNetwork& target) {
-        for(int i=0; i<INPUT_SIZE; ++i)
-            for(int j=0; j<HIDDEN_SIZE; ++j)
-                W1[i][j] = TAU * target.W1[i][j] + (1-TAU) * W1[i][j];
-        
-        for(int i=0; i<HIDDEN_SIZE; ++i) {
-            b1[i] = TAU * target.b1[i] + (1-TAU) * b1[i];
-            for(int j=0; j<HIDDEN_SIZE; ++j)
-                W2[i][j] = TAU * target.W2[i][j] + (1-TAU) * W2[i][j];
-            b2[i] = TAU * target.b2[i] + (1-TAU) * b2[i];
-        }
-        
-        for(int i=0; i<HIDDEN_SIZE; ++i)
-            for(int j=0; j<OUTPUT_SIZE; ++j)
-                W3[i][j] = TAU * target.W3[i][j] + (1-TAU) * W3[i][j];
-        
-        for(int j=0; j<OUTPUT_SIZE; ++j)
-            b3[j] = TAU * target.b3[j] + (1-TAU) * b3[j];
-    }
-
-    void update(const NeuralNetwork& target, const std::vector<Experience>& batch) {
-        double dW1[INPUT_SIZE][HIDDEN_SIZE] = {0};
-        double db1[HIDDEN_SIZE] = {0};
-        double dW2[HIDDEN_SIZE][HIDDEN_SIZE] = {0};
-        double db2[HIDDEN_SIZE] = {0};
-        double dW3[HIDDEN_SIZE][OUTPUT_SIZE] = {0};
-        double db3[OUTPUT_SIZE] = {0};
-
-        for(const auto& exp : batch) {
-            auto q_current = forward(exp.state);
-            auto q_next = target.forward(exp.next_state);
-            
-            double target_val = exp.reward;
-            if(!exp.done)
-                target_val += GAMMA * *std::max_element(q_next.begin(), q_next.end());
-            
-            double delta = target_val - q_current[exp.action];
-            
-            double h1[HIDDEN_SIZE] = {0};
-            for(int j=0; j<HIDDEN_SIZE; ++j) 
-                for(int i=0; i<INPUT_SIZE; ++i)
-                    h1[j] += exp.state[i] * W1[i][j];
-            
-            double h2[HIDDEN_SIZE] = {0};
-            for(int j=0; j<HIDDEN_SIZE; ++j)
-                for(int i=0; i<HIDDEN_SIZE; ++i)
-                    h2[j] += h1[i] * W2[i][j];
-            
-            for(int j=0; j<OUTPUT_SIZE; ++j) {
-                double grad = (j == exp.action) ? delta : 0;
-                for(int i=0; i<HIDDEN_SIZE; ++i) {
-                    dW3[i][j] += grad * h2[i];
-                    db3[j] += grad;
-                }
-            }
-            
-            for(int i=0; i<HIDDEN_SIZE; ++i) {
-                double grad_h2 = 0;
-                for(int j=0; j<OUTPUT_SIZE; ++j)
-                    grad_h2 += delta * W3[i][j];
-                grad_h2 *= (h2[i] > 0);
-                
-                for(int k=0; k<HIDDEN_SIZE; ++k) {
-                    dW2[k][i] += grad_h2 * h1[k];
-                    db2[i] += grad_h2;
-                }
-            }
-            
-            for(int i=0; i<HIDDEN_SIZE; ++i) {
-                double grad_h1 = 0;
-                for(int j=0; j<HIDDEN_SIZE; ++j)
-                    grad_h1 += dW2[i][j] * (h1[j] > 0);
-                
-                for(int k=0; k<INPUT_SIZE; ++k) {
-                    dW1[k][i] += grad_h1 * exp.state[k];
-                    db1[i] += grad_h1;
-                }
-            }
-        }
-        
-        for(int i=0; i<INPUT_SIZE; ++i)
-            for(int j=0; j<HIDDEN_SIZE; ++j)
-                W1[i][j] += LEARNING_RATE * dW1[i][j] / BATCH_SIZE;
-        
-        for(int i=0; i<HIDDEN_SIZE; ++i) {
-            b1[i] += LEARNING_RATE * db1[i] / BATCH_SIZE;
-            for(int j=0; j<HIDDEN_SIZE; ++j)
-                W2[i][j] += LEARNING_RATE * dW2[i][j] / BATCH_SIZE;
-            b2[i] += LEARNING_RATE * db2[i] / BATCH_SIZE;
-        }
-        
-        for(int i=0; i<HIDDEN_SIZE; ++i)
-            for(int j=0; j<OUTPUT_SIZE; ++j)
-                W3[i][j] += LEARNING_RATE * dW3[i][j] / BATCH_SIZE;
-        
-        for(int j=0; j<OUTPUT_SIZE; ++j)
-            b3[j] += LEARNING_RATE * db3[j] / BATCH_SIZE;
+    void soft_update(const ConvNet& target, float tau) {
+        conv_weights = tau * target.conv_weights + (1 - tau) * conv_weights;
+        conv_biases = tau * target.conv_biases + (1 - tau) * conv_biases;
+        fc1_weights = tau * target.fc1_weights + (1 - tau) * fc1_weights;
+        fc1_biases = tau * target.fc1_biases + (1 - tau) * fc1_biases;
+        fc2_weights = tau * target.fc2_weights + (1 - tau) * fc2_weights;
+        fc2_biases = tau * target.fc2_biases + (1 - tau) * fc2_biases;
+        fc3_weights = tau * target.fc3_weights + (1 - tau) * fc3_weights;
+        fc3_biases = tau * target.fc3_biases + (1 - tau) * fc3_biases;
     }
 
     void save(const std::string& path) {
         std::ofstream file(path, std::ios::binary);
-        file.write((char*)W1, sizeof(W1));
-        file.write((char*)b1, sizeof(b1));
-        file.write((char*)W2, sizeof(W2));
-        file.write((char*)b2, sizeof(b2));
-        file.write((char*)W3, sizeof(W3));
-        file.write((char*)b3, sizeof(b3));
+        file.write(reinterpret_cast<const char*>(conv_weights.data()), conv_weights.size() * sizeof(float));
+        file.write(reinterpret_cast<const char*>(conv_biases.data()), conv_biases.size() * sizeof(float));
+        file.write(reinterpret_cast<const char*>(fc1_weights.data()), fc1_weights.size() * sizeof(float));
+        file.write(reinterpret_cast<const char*>(fc1_biases.data()), fc1_biases.size() * sizeof(float));
+        file.write(reinterpret_cast<const char*>(fc2_weights.data()), fc2_weights.size() * sizeof(float));
+        file.write(reinterpret_cast<const char*>(fc2_biases.data()), fc2_biases.size() * sizeof(float));
+        file.write(reinterpret_cast<const char*>(fc3_weights.data()), fc3_weights.size() * sizeof(float));
+        file.write(reinterpret_cast<const char*>(fc3_biases.data()), fc3_biases.size() * sizeof(float));
     }
 
     void load(const std::string& path) {
         std::ifstream file(path, std::ios::binary);
-        file.read((char*)W1, sizeof(W1));
-        file.read((char*)b1, sizeof(b1));
-        file.read((char*)W2, sizeof(W2));
-        file.read((char*)b2, sizeof(b2));
-        file.read((char*)W3, sizeof(W3));
-        file.read((char*)b3, sizeof(b3));
+        file.read(reinterpret_cast<char*>(conv_weights.data()), conv_weights.size() * sizeof(float));
+        file.read(reinterpret_cast<char*>(conv_biases.data()), conv_biases.size() * sizeof(float));
+        file.read(reinterpret_cast<char*>(fc1_weights.data()), fc1_weights.size() * sizeof(float));
+        file.read(reinterpret_cast<char*>(fc1_biases.data()), fc1_biases.size() * sizeof(float));
+        file.read(reinterpret_cast<char*>(fc2_weights.data()), fc2_weights.size() * sizeof(float));
+        file.read(reinterpret_cast<char*>(fc2_biases.data()), fc2_biases.size() * sizeof(float));
+        file.read(reinterpret_cast<char*>(fc3_weights.data()), fc3_weights.size() * sizeof(float));
+        file.read(reinterpret_cast<char*>(fc3_biases.data()), fc3_biases.size() * sizeof(float));
     }
 };
 
-std::vector<Experience> memory;
-NeuralNetwork policy_net, target_net;
-std::mt19937 gen(std::random_device{}());
-double epsilon = EPS_START;
+class PrioritizedReplay {
+private:
+    std::vector<Experience> buffer;
+    std::vector<float> priorities;
+    std::atomic<size_t> position{0};
+    std::mutex mtx;
+    float alpha = 0.6f;
+    float beta = 0.4f;
 
-std::bitset<INPUT_SIZE> board_to_state(const std::vector<std::vector<char>>& board) {
-    std::bitset<INPUT_SIZE> state;
-    int idx = 0;
-    for(int i=0; i<ROWS; ++i)
-        for(int j=0; j<COLS; ++j) {
-            state[idx++] = (board[i][j] == 'R');
-            state[idx++] = (board[i][j] == 'Y');
+public:
+    void add(const Experience& exp) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (buffer.size() < MEMORY_CAPACITY) {
+            buffer.push_back(exp);
+            priorities.push_back(exp.priority);
+        } else {
+            buffer[position % MEMORY_CAPACITY] = exp;
+            priorities[position % MEMORY_CAPACITY] = exp.priority;
         }
-    return state;
+        position++;
+    }
+
+    std::vector<Experience> sample(int batch_size) {
+        std::vector<float> probs(priorities.begin(), priorities.end());
+        for(auto& p : probs) p = std::pow(p, alpha);
+        float sum = std::accumulate(probs.begin(), probs.end(), 0.0f);
+        for(auto& p : probs) p /= sum;
+
+        std::discrete_distribution<int> dist(probs.begin(), probs.end());
+        std::vector<Experience> batch;
+        std::mt19937 gen(std::random_device{}());
+        std::lock_guard<std::mutex> lock(mtx);
+        
+        for(int i=0; i<batch_size; ++i)
+            batch.push_back(buffer[dist(gen)]);
+        
+        return batch;
+    }
+
+    void update_priorities(const std::vector<float>& new_priorities) {
+        std::lock_guard<std::mutex> lock(mtx);
+        for(size_t i=0; i<new_priorities.size(); ++i)
+            priorities[i] = new_priorities[i];
+    }
+};
+
+ConvNet policy_net, target_net;
+PrioritizedReplay replay_buffer;
+std::atomic<bool> training_active{true};
+std::atomic<int> global_step{0};
+
+Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> board_to_tensor(const std::vector<std::vector<char>>& board) {
+    Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> tensor;
+    for(int r=0; r<ROWS; ++r) {
+        for(int c=0; c<COLS; ++c) {
+            tensor(0, r*COLS + c) = (board[r][c] == 'R') ? 1.0f : 0.0f;
+            tensor(1, r*COLS + c) = (board[r][c] == 'Y') ? 1.0f : 0.0f;
+        }
+    }
+    return tensor;
 }
 
-int select_action(const std::bitset<INPUT_SIZE>& state, const NeuralNetwork& model, bool training) {
+int select_action(const Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS>& state, float epsilon) {
+    static thread_local std::mt19937 gen(std::random_device{}());
     std::vector<int> valid_actions;
-    for(int col=0; col<COLS; ++col)
-        if(state[col*2] == 0 && state[col*2+1] == 0)
-            valid_actions.push_back(col);
+    for(int c=0; c<COLS; ++c)
+        if(state(0, (ROWS-1)*COLS + c) == 0 && state(1, (ROWS-1)*COLS + c) == 0)
+            valid_actions.push_back(c);
     
     if(valid_actions.empty()) return -1;
     
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-    if(training && dist(gen) < epsilon) {
-        std::uniform_int_distribution<int> action_dist(0, valid_actions.size()-1);
-        return valid_actions[action_dist(gen)];
-    }
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    if(dist(gen) < epsilon)
+        return valid_actions[gen() % valid_actions.size()];
     
-    auto q_values = model.forward(state);
-    std::vector<std::pair<double, int>> action_values;
+    Vector q_values = policy_net.forward(state);
+    int best_action = valid_actions[0];
+    float best_value = q_values[best_action];
     for(int a : valid_actions)
-        action_values.emplace_back(q_values[a], a);
-    
-    return std::max_element(action_values.begin(), action_values.end())->second;
+        if(q_values[a] > best_value)
+            best_action = a, best_value = q_values[a];
+    return best_action;
 }
 
 bool check_win(const std::vector<std::vector<char>>& board, char player) {
-    auto check_line = [&](int r, int c, int dr, int dc) {
+    auto check = [&](int r, int c, int dr, int dc) {
         for(int i=0; i<4; ++i)
             if(board[r + i*dr][c + i*dc] != player) return false;
         return true;
@@ -255,110 +222,120 @@ bool check_win(const std::vector<std::vector<char>>& board, char player) {
     
     for(int r=0; r<ROWS; ++r)
         for(int c=0; c<COLS-3; ++c)
-            if(check_line(r, c, 0, 1)) return true;
-    
+            if(check(r, c, 0, 1)) return true;
     for(int c=0; c<COLS; ++c)
         for(int r=0; r<ROWS-3; ++r)
-            if(check_line(r, c, 1, 0)) return true;
-    
+            if(check(r, c, 1, 0)) return true;
     for(int r=0; r<ROWS-3; ++r)
         for(int c=0; c<COLS-3; ++c)
-            if(check_line(r, c, 1, 1)) return true;
-    
+            if(check(r, c, 1, 1)) return true;
     for(int r=3; r<ROWS; ++r)
         for(int c=0; c<COLS-3; ++c)
-            if(check_line(r, c, -1, 1)) return true;
-    
+            if(check(r, c, -1, 1)) return true;
     return false;
 }
 
-void train_ai(int games) {
-    _mkdir("memory");
-    target_net = policy_net;
-    int update_counter = 0;
-    int wins = 0, losses = 0, draws = 0;
-    auto training_start = std::chrono::steady_clock::now();
+void actor_thread(int thread_id) {
+    std::vector<std::vector<char>> board(ROWS, std::vector<char>(COLS, ' '));
+    float epsilon = std::pow(0.01f, (float)thread_id/NUM_ACTORS);
     
-    for(int game=0; game<games; ++game) {
-        std::vector<std::vector<char>> board(ROWS, std::vector<char>(COLS, ' '));
+    while(training_active) {
+        board = std::vector<std::vector<char>>(ROWS, std::vector<char>(COLS, ' '));
         char current = 'Y';
         std::vector<Experience> episode;
         bool done = false;
-        char winner = ' ';
         
-        while(!done) {
-            auto state = board_to_state(board);
-            int action = select_action(state, policy_net, true);
+        while(!done && training_active) {
+            auto state_tensor = board_to_tensor(board);
+            int action = select_action(state_tensor, epsilon);
             
             if(action == -1) break;
             int row = ROWS-1;
             while(row >=0 && board[row][action] != ' ') row--;
             board[row][action] = current;
             
-            double reward = 0;
+            float reward = 0;
             if(check_win(board, current)) {
-                reward = (current == 'Y') ? 1.0 : -1.0;
+                reward = (current == 'Y') ? 1.0f : -1.0f;
                 done = true;
-                winner = current;
             }
             else if(std::all_of(board[0].begin(), board[0].end(), 
-                [](char c) { return c != ' '; })) {
-                done = true;
-                draws++;
-            }
+                [](char c) { return c != ' '; })) done = true;
             
-            auto next_state = board_to_state(board);
-            episode.push_back({state, action, reward, next_state, done});
+            Experience exp;
+            exp.state = state_tensor;
+            exp.action = action;
+            exp.reward = reward;
+            exp.next_state = board_to_tensor(board);
+            exp.done = done;
+            exp.priority = 1.0f;
+            
+            episode.push_back(exp);
             current = (current == 'Y') ? 'R' : 'Y';
         }
         
-        if(winner == 'Y') wins++;
-        else if(winner == 'R') losses++;
-        
-        for(auto& exp : episode) {
-            if(memory.size() >= MEMORY_CAPACITY)
-                memory[gen() % MEMORY_CAPACITY] = exp;
-            else
-                memory.push_back(exp);
-        }
-        
-        if(memory.size() >= BATCH_SIZE) {
-            std::vector<Experience> batch;
-            std::sample(memory.begin(), memory.end(), std::back_inserter(batch),
-                       BATCH_SIZE, gen);
-            policy_net.update(target_net, batch);
-            policy_net.soft_update(target_net);
-        }
-        
-        epsilon = std::max(EPS_END, epsilon * EPS_DECAY);
-        
-        if((game+1) % 100 == 0) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - training_start).count();
-            double games_per_sec = 100.0 / (elapsed > 0 ? elapsed : 1);
-            
-            std::cout << "Game " << std::setw(6) << game+1 << "/" << games 
-                      << " | EPS: " << std::fixed << std::setprecision(4) << epsilon
-                      << " | W/L/D: " << wins << "/" << losses << "/" << draws
-                      << " | GPS: " << std::setprecision(1) << games_per_sec
-                      << " | Mem: " << memory.size() << "     \r";
-            std::cout.flush();
-            
-            wins = losses = draws = 0;
-            training_start = now;
-        }
-        
-        if((game+1) % 1000 == 0) {
-            policy_net.save("memory/policy.bin");
-            target_net.save("memory/target.bin");
-        }
+        for(auto& exp : episode)
+            replay_buffer.add(exp);
     }
-    std::cout << "\nTraining complete. Models saved to memory/\n";
+}
+
+void learner_thread() {
+    std::vector<Experience> batch;
+    std::vector<float> losses;
+    
+    while(training_active) {
+        batch = replay_buffer.sample(BATCH_SIZE);
+        std::vector<float> new_priorities;
+        new_priorities.reserve(BATCH_SIZE);
+        
+        for(auto& exp : batch) {
+            Vector q_current = policy_net.forward(exp.state);
+            Vector q_next = target_net.forward(exp.next_state);
+            
+            float target = exp.reward;
+            if(!exp.done) target += GAMMA * q_next.maxCoeff();
+            float td_error = std::abs(target - q_current[exp.action]);
+            new_priorities.push_back(td_error + 1e-5f);
+        }
+        
+        replay_buffer.update_priorities(new_priorities);
+        
+        if(global_step++ % TARGET_UPDATE == 0)
+            policy_net.soft_update(target_net, 0.01f);
+    }
+}
+
+void train_ai(int games) {
+    _mkdir("memory");
+    std::vector<std::thread> actors;
+    std::vector<std::thread> learners;
+    
+    for(int i=0; i<NUM_ACTORS; ++i)
+        actors.emplace_back(actor_thread, i);
+    for(int i=0; i<NUM_LEARNERS; ++i)
+        learners.emplace_back(learner_thread);
+    
+    auto start = std::chrono::steady_clock::now();
+    while(global_step < games && training_active) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        auto now = std::chrono::steady_clock::now();
+        float elapsed = std::chrono::duration<float>(now - start).count();
+        std::cout << "Step: " << global_step << "/" << games 
+                  << " | Steps/s: " << global_step/elapsed << "\r";
+    }
+    
+    training_active = false;
+    for(auto& t : actors) if(t.joinable()) t.join();
+    for(auto& t : learners) if(t.joinable()) t.join();
+    
+    policy_net.save("memory/policy.bin");
+    target_net.save("memory/target.bin");
+    std::cout << "\nTraining complete.\n";
 }
 
 int ai_move(const std::vector<std::vector<char>>& board) {
-    auto state = board_to_state(board);
-    return select_action(state, policy_net, false);
+    auto state = board_to_tensor(board);
+    return select_action(state, 0.0f);
 }
 
 void display_board(const std::vector<std::vector<char>>& board) {
@@ -385,10 +362,10 @@ int main() {
     std::cin >> choice;
     
     if(choice == 2) {
-        std::cout << "Training games: ";
-        int games;
-        std::cin >> games;
-        train_ai(games);
+        std::cout << "Training steps: ";
+        int steps;
+        std::cin >> steps;
+        train_ai(steps);
         return 0;
     }
     
