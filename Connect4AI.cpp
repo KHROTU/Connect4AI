@@ -38,6 +38,7 @@ struct Experience {
     Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> next_state;
     bool done;
     float priority;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
 class ConvNet {
@@ -74,16 +75,29 @@ public:
     }
 
     Vector forward(const Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS>& input) const {
-        constexpr int CONV_SIZE = ROWS*COLS;
-        Eigen::Matrix<float, CONV_FILTERS, CONV_SIZE> conv_out;
+        Eigen::Matrix<float, CONV_FILTERS, ROWS*COLS> conv_out;
         
         for(int i = 0; i < CONV_FILTERS; ++i) {
-            for(int j = 0; j < CONV_SIZE; ++j) {
+            for(int pos = 0; pos < ROWS*COLS; ++pos) {
+                int r = pos / COLS;
+                int c = pos % COLS;
                 float sum = 0.0f;
-                for(int k = 0; k < INPUT_CHANNELS*3*3; ++k) {
-                    sum += conv_weights(i, k) * input(k % INPUT_CHANNELS, j);
+                
+                for(int ch = 0; ch < INPUT_CHANNELS; ++ch) {
+                    for(int dr = -1; dr <= 1; ++dr) {
+                        for(int dc = -1; dc <= 1; ++dc) {
+                            int input_r = r + dr;
+                            int input_c = c + dc;
+                            if(input_r >=0 && input_r < ROWS && input_c >=0 && input_c < COLS) {
+                                int input_pos = input_r * COLS + input_c;
+                                int weight_idx = ch * 9 + (dr + 1) * 3 + (dc + 1);
+                                sum += conv_weights(i, weight_idx) * input(ch, input_pos);
+                            }
+                        }
+                    }
                 }
-                conv_out(i, j) = std::max(sum + conv_biases[i], 0.0f);
+                
+                conv_out(i, pos) = std::max(sum + conv_biases[i], 0.0f);
             }
         }
 
@@ -131,7 +145,7 @@ public:
 
 class PrioritizedReplay {
 private:
-    std::vector<Experience> buffer;
+    std::vector<Experience, Eigen::aligned_allocator<Experience>> buffer;
     std::vector<float> priorities;
     std::atomic<size_t> position{0};
     std::mutex mtx;
@@ -179,6 +193,7 @@ ConvNet policy_net, target_net;
 PrioritizedReplay replay_buffer;
 std::atomic<bool> training_active{true};
 std::atomic<int> global_step{0};
+std::atomic<bool> visualize_training{false};
 
 Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> board_to_tensor(const std::vector<std::vector<char>>& board) {
     Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS> tensor;
@@ -195,7 +210,7 @@ int select_action(const Eigen::Matrix<float, INPUT_CHANNELS, ROWS*COLS>& state, 
     static thread_local std::mt19937 gen(std::random_device{}());
     std::vector<int> valid_actions;
     for(int c=0; c<COLS; ++c)
-        if(state(0, (ROWS-1)*COLS + c) == 0 && state(1, (ROWS-1)*COLS + c) == 0)
+        if(state(0, 0*COLS + c) == 0 && state(1, 0*COLS + c) == 0)
             valid_actions.push_back(c);
     
     if(valid_actions.empty()) return -1;
@@ -235,7 +250,25 @@ bool check_win(const std::vector<std::vector<char>>& board, char player) {
     return false;
 }
 
-void actor_thread(int thread_id) {
+void display_board(const std::vector<std::vector<char>>& board) {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    std::cout << "\n";
+    for(int r=0; r<ROWS; ++r) {
+        for(int c=0; c<COLS; ++c) {
+            std::cout << "| ";
+            if(board[r][c] == 'R') SetConsoleTextAttribute(hConsole, 12);
+            else if(board[r][c] == 'Y') SetConsoleTextAttribute(hConsole, 14);
+            std::cout << board[r][c];
+            SetConsoleTextAttribute(hConsole, 7);
+            std::cout << " ";
+        }
+        std::cout << "|\n";
+    }
+    std::cout << "+---+---+---+---+---+---+---+\n";
+    std::cout << "  1   2   3   4   5   6   7\n";
+}
+
+void actor_thread(int thread_id, bool visualize) {
     std::vector<std::vector<char>> board(ROWS, std::vector<char>(COLS, ' '));
     float epsilon = std::pow(0.01f, (float)thread_id/NUM_ACTORS);
     
@@ -252,15 +285,21 @@ void actor_thread(int thread_id) {
             if(action == -1) break;
             int row = ROWS-1;
             while(row >=0 && board[row][action] != ' ') row--;
+            if(row < 0) break;
             board[row][action] = current;
+            
+            if(visualize) {
+                system("cls");
+                display_board(board);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
             
             float reward = 0;
             if(check_win(board, current)) {
                 reward = (current == 'Y') ? 1.0f : -1.0f;
                 done = true;
             }
-            else if(std::all_of(board[0].begin(), board[0].end(), 
-                [](char c) { return c != ' '; })) done = true;
+            else if(std::all_of(board[0].begin(), board[0].end(), [](char c) { return c != ' '; })) done = true;
             
             Experience exp;
             exp.state = state_tensor;
@@ -281,7 +320,6 @@ void actor_thread(int thread_id) {
 
 void learner_thread() {
     std::vector<Experience> batch;
-    std::vector<float> losses;
     
     while(training_active) {
         batch = replay_buffer.sample(BATCH_SIZE);
@@ -310,8 +348,12 @@ void train_ai(int games) {
     std::vector<std::thread> actors;
     std::vector<std::thread> learners;
     
+    bool visualize = false;
+    std::cout << "Visualize training? (1=Yes, 0=No): ";
+    std::cin >> visualize;
+    
     for(int i=0; i<NUM_ACTORS; ++i)
-        actors.emplace_back(actor_thread, i);
+        actors.emplace_back(actor_thread, i, (i == 0 && visualize));
     for(int i=0; i<NUM_LEARNERS; ++i)
         learners.emplace_back(learner_thread);
     
@@ -335,25 +377,16 @@ void train_ai(int games) {
 
 int ai_move(const std::vector<std::vector<char>>& board) {
     auto state = board_to_tensor(board);
-    return select_action(state, 0.0f);
-}
-
-void display_board(const std::vector<std::vector<char>>& board) {
-    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-    std::cout << "\n";
-    for(int r=0; r<ROWS; ++r) {
+    int move = select_action(state, 0.0f);
+    if(move == -1 || board[0][move] != ' ') {
         for(int c=0; c<COLS; ++c) {
-            std::cout << "| ";
-            if(board[r][c] == 'R') SetConsoleTextAttribute(hConsole, 12);
-            else if(board[r][c] == 'Y') SetConsoleTextAttribute(hConsole, 14);
-            std::cout << board[r][c];
-            SetConsoleTextAttribute(hConsole, 7);
-            std::cout << " ";
+            if(board[0][c] == ' ') {
+                move = c;
+                break;
+            }
         }
-        std::cout << "|\n";
     }
-    std::cout << "+---+---+---+---+---+---+---+\n";
-    std::cout << "  1   2   3   4   5   6   7\n";
+    return move;
 }
 
 int main() {
@@ -401,7 +434,7 @@ int main() {
             int move = ai_move(board);
             int row = ROWS-1;
             while(row >=0 && board[row][move] != ' ') row--;
-            board[row][move] = ai;
+            if(row >= 0) board[row][move] = ai;
         }
         
         if(check_win(board, current)) {
@@ -411,8 +444,7 @@ int main() {
             break;
         }
         
-        if(std::all_of(board[0].begin(), board[0].end(), 
-            [](char c) { return c != ' '; })) {
+        if(std::all_of(board[0].begin(), board[0].end(), [](char c) { return c != ' '; })) {
             system("cls");
             display_board(board);
             std::cout << "Draw!\n";
