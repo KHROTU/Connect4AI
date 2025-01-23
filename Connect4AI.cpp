@@ -8,76 +8,369 @@
 #include <chrono>
 #include <random>
 #include <bitset>
+#include <fstream>
+#include <direct.h>
+#include <numeric>
+#include <iomanip>
 
 const int ROWS = 6;
 const int COLS = 7;
-const int WIN_SCORE = 100000000;
-const int MAX_DEPTH = 12;
-const int CENTER_WEIGHTS[COLS] = {1, 3, 6, 9, 6, 3, 1};
-const int TIMEOUT_MS = 8500;
+const int INPUT_SIZE = ROWS * COLS * 2;
+const int HIDDEN_SIZE = 256;
+const int OUTPUT_SIZE = COLS;
+const double LEARNING_RATE = 0.0005;
+const double GAMMA = 0.97;
+const int BATCH_SIZE = 256;
+const int MEMORY_CAPACITY = 1000000;
+const int TARGET_UPDATE = 50;
+const double EPS_START = 1.0;
+const double EPS_END = 0.01;
+const double EPS_DECAY = 0.9997;
+const double TAU = 0.005;
 
-struct TranspositionEntry {
-    int depth;
-    int score;
-    int flag;
-    uint64_t key;
+struct Experience {
+    std::bitset<INPUT_SIZE> state;
+    int action;
+    double reward;
+    std::bitset<INPUT_SIZE> next_state;
+    bool done;
 };
 
-std::vector<std::vector<char>> board(ROWS, std::vector<char>(COLS, ' '));
-std::unordered_map<uint64_t, TranspositionEntry> transpositionTable;
-char currentPlayer = 'R';
-std::vector<std::vector<std::pair<int, int>>> winningLines;
-std::chrono::time_point<std::chrono::steady_clock> searchStart;
-bool timeout = false;
-
-uint64_t zobristTable[ROWS][COLS][2];
-uint64_t gameHash = 0;
-
-void InitializeZobrist() {
-    std::mt19937_64 gen(0xDEADBEEF);
-    for (int i = 0; i < ROWS; ++i)
-        for (int j = 0; j < COLS; ++j)
-            for (int k = 0; k < 2; ++k)
-                zobristTable[i][j][k] = gen();
-}
-
-void InitializeWinningLines() {
-    winningLines.clear();
-    for (int row = 0; row < ROWS; ++row)
-        for (int col = 0; col <= COLS-4; ++col)
-            winningLines.push_back({{row,col}, {row,col+1}, {row,col+2}, {row,col+3}});
+struct NeuralNetwork {
+    double W1[INPUT_SIZE][HIDDEN_SIZE];
+    double b1[HIDDEN_SIZE];
+    double W2[HIDDEN_SIZE][HIDDEN_SIZE];
+    double b2[HIDDEN_SIZE];
+    double W3[HIDDEN_SIZE][OUTPUT_SIZE];
+    double b3[OUTPUT_SIZE];
     
-    for (int col = 0; col < COLS; ++col)
-        for (int row = 0; row <= ROWS-4; ++row)
-            winningLines.push_back({{row,col}, {row+1,col}, {row+2,col}, {row+3,col}});
+    NeuralNetwork() {
+        std::mt19937 gen(42);
+        std::normal_distribution<double> dist(0.0, 0.1);
+        
+        auto init_weights = [&](auto& arr, int size1, int size2) {
+            for(int i=0; i<size1; ++i)
+                for(int j=0; j<size2; ++j)
+                    arr[i][j] = dist(gen);
+        };
+        
+        init_weights(W1, INPUT_SIZE, HIDDEN_SIZE);
+        init_weights(W2, HIDDEN_SIZE, HIDDEN_SIZE);
+        init_weights(W3, HIDDEN_SIZE, OUTPUT_SIZE);
+        std::fill(b1, b1+HIDDEN_SIZE, 0.0);
+        std::fill(b2, b2+HIDDEN_SIZE, 0.0);
+        std::fill(b3, b3+OUTPUT_SIZE, 0.0);
+    }
+
+    double relu(double x) const { return x > 0 ? x : 0; }
+
+    std::vector<double> forward(const std::bitset<INPUT_SIZE>& input) const {
+        double h1[HIDDEN_SIZE] = {0};
+        for(int j=0; j<HIDDEN_SIZE; ++j) {
+            for(int i=0; i<INPUT_SIZE; ++i)
+                h1[j] += input[i] * W1[i][j];
+            h1[j] = relu(h1[j] + b1[j]);
+        }
+        
+        double h2[HIDDEN_SIZE] = {0};
+        for(int j=0; j<HIDDEN_SIZE; ++j) {
+            for(int i=0; i<HIDDEN_SIZE; ++i)
+                h2[j] += h1[i] * W2[i][j];
+            h2[j] = relu(h2[j] + b2[j]);
+        }
+        
+        std::vector<double> output(OUTPUT_SIZE);
+        for(int j=0; j<OUTPUT_SIZE; ++j) {
+            for(int i=0; i<HIDDEN_SIZE; ++i)
+                output[j] += h2[i] * W3[i][j];
+            output[j] += b3[j];
+        }
+        return output;
+    }
+
+    void soft_update(const NeuralNetwork& target) {
+        for(int i=0; i<INPUT_SIZE; ++i)
+            for(int j=0; j<HIDDEN_SIZE; ++j)
+                W1[i][j] = TAU * target.W1[i][j] + (1-TAU) * W1[i][j];
+        
+        for(int i=0; i<HIDDEN_SIZE; ++i) {
+            b1[i] = TAU * target.b1[i] + (1-TAU) * b1[i];
+            for(int j=0; j<HIDDEN_SIZE; ++j)
+                W2[i][j] = TAU * target.W2[i][j] + (1-TAU) * W2[i][j];
+            b2[i] = TAU * target.b2[i] + (1-TAU) * b2[i];
+        }
+        
+        for(int i=0; i<HIDDEN_SIZE; ++i)
+            for(int j=0; j<OUTPUT_SIZE; ++j)
+                W3[i][j] = TAU * target.W3[i][j] + (1-TAU) * W3[i][j];
+        
+        for(int j=0; j<OUTPUT_SIZE; ++j)
+            b3[j] = TAU * target.b3[j] + (1-TAU) * b3[j];
+    }
+
+    void update(const NeuralNetwork& target, const std::vector<Experience>& batch) {
+        double dW1[INPUT_SIZE][HIDDEN_SIZE] = {0};
+        double db1[HIDDEN_SIZE] = {0};
+        double dW2[HIDDEN_SIZE][HIDDEN_SIZE] = {0};
+        double db2[HIDDEN_SIZE] = {0};
+        double dW3[HIDDEN_SIZE][OUTPUT_SIZE] = {0};
+        double db3[OUTPUT_SIZE] = {0};
+
+        for(const auto& exp : batch) {
+            auto q_current = forward(exp.state);
+            auto q_next = target.forward(exp.next_state);
+            
+            double target_val = exp.reward;
+            if(!exp.done)
+                target_val += GAMMA * *std::max_element(q_next.begin(), q_next.end());
+            
+            double delta = target_val - q_current[exp.action];
+            
+            double h1[HIDDEN_SIZE] = {0};
+            for(int j=0; j<HIDDEN_SIZE; ++j) 
+                for(int i=0; i<INPUT_SIZE; ++i)
+                    h1[j] += exp.state[i] * W1[i][j];
+            
+            double h2[HIDDEN_SIZE] = {0};
+            for(int j=0; j<HIDDEN_SIZE; ++j)
+                for(int i=0; i<HIDDEN_SIZE; ++i)
+                    h2[j] += h1[i] * W2[i][j];
+            
+            for(int j=0; j<OUTPUT_SIZE; ++j) {
+                double grad = (j == exp.action) ? delta : 0;
+                for(int i=0; i<HIDDEN_SIZE; ++i) {
+                    dW3[i][j] += grad * h2[i];
+                    db3[j] += grad;
+                }
+            }
+            
+            for(int i=0; i<HIDDEN_SIZE; ++i) {
+                double grad_h2 = 0;
+                for(int j=0; j<OUTPUT_SIZE; ++j)
+                    grad_h2 += delta * W3[i][j];
+                grad_h2 *= (h2[i] > 0);
+                
+                for(int k=0; k<HIDDEN_SIZE; ++k) {
+                    dW2[k][i] += grad_h2 * h1[k];
+                    db2[i] += grad_h2;
+                }
+            }
+            
+            for(int i=0; i<HIDDEN_SIZE; ++i) {
+                double grad_h1 = 0;
+                for(int j=0; j<HIDDEN_SIZE; ++j)
+                    grad_h1 += dW2[i][j] * (h1[j] > 0);
+                
+                for(int k=0; k<INPUT_SIZE; ++k) {
+                    dW1[k][i] += grad_h1 * exp.state[k];
+                    db1[i] += grad_h1;
+                }
+            }
+        }
+        
+        for(int i=0; i<INPUT_SIZE; ++i)
+            for(int j=0; j<HIDDEN_SIZE; ++j)
+                W1[i][j] += LEARNING_RATE * dW1[i][j] / BATCH_SIZE;
+        
+        for(int i=0; i<HIDDEN_SIZE; ++i) {
+            b1[i] += LEARNING_RATE * db1[i] / BATCH_SIZE;
+            for(int j=0; j<HIDDEN_SIZE; ++j)
+                W2[i][j] += LEARNING_RATE * dW2[i][j] / BATCH_SIZE;
+            b2[i] += LEARNING_RATE * db2[i] / BATCH_SIZE;
+        }
+        
+        for(int i=0; i<HIDDEN_SIZE; ++i)
+            for(int j=0; j<OUTPUT_SIZE; ++j)
+                W3[i][j] += LEARNING_RATE * dW3[i][j] / BATCH_SIZE;
+        
+        for(int j=0; j<OUTPUT_SIZE; ++j)
+            b3[j] += LEARNING_RATE * db3[j] / BATCH_SIZE;
+    }
+
+    void save(const std::string& path) {
+        std::ofstream file(path, std::ios::binary);
+        file.write((char*)W1, sizeof(W1));
+        file.write((char*)b1, sizeof(b1));
+        file.write((char*)W2, sizeof(W2));
+        file.write((char*)b2, sizeof(b2));
+        file.write((char*)W3, sizeof(W3));
+        file.write((char*)b3, sizeof(b3));
+    }
+
+    void load(const std::string& path) {
+        std::ifstream file(path, std::ios::binary);
+        file.read((char*)W1, sizeof(W1));
+        file.read((char*)b1, sizeof(b1));
+        file.read((char*)W2, sizeof(W2));
+        file.read((char*)b2, sizeof(b2));
+        file.read((char*)W3, sizeof(W3));
+        file.read((char*)b3, sizeof(b3));
+    }
+};
+
+std::vector<Experience> memory;
+NeuralNetwork policy_net, target_net;
+std::mt19937 gen(std::random_device{}());
+double epsilon = EPS_START;
+
+std::bitset<INPUT_SIZE> board_to_state(const std::vector<std::vector<char>>& board) {
+    std::bitset<INPUT_SIZE> state;
+    int idx = 0;
+    for(int i=0; i<ROWS; ++i)
+        for(int j=0; j<COLS; ++j) {
+            state[idx++] = (board[i][j] == 'R');
+            state[idx++] = (board[i][j] == 'Y');
+        }
+    return state;
+}
+
+int select_action(const std::bitset<INPUT_SIZE>& state, const NeuralNetwork& model, bool training) {
+    std::vector<int> valid_actions;
+    for(int col=0; col<COLS; ++col)
+        if(state[col*2] == 0 && state[col*2+1] == 0)
+            valid_actions.push_back(col);
     
-    for (int row = 0; row <= ROWS-4; ++row)
-        for (int col = 0; col <= COLS-4; ++col)
-            winningLines.push_back({{row,col}, {row+1,col+1}, {row+2,col+2}, {row+3,col+3}});
+    if(valid_actions.empty()) return -1;
     
-    for (int row = 3; row < ROWS; ++row)
-        for (int col = 0; col <= COLS-4; ++col)
-            winningLines.push_back({{row,col}, {row-1,col+1}, {row-2,col+2}, {row-3,col+3}});
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    if(training && dist(gen) < epsilon) {
+        std::uniform_int_distribution<int> action_dist(0, valid_actions.size()-1);
+        return valid_actions[action_dist(gen)];
+    }
+    
+    auto q_values = model.forward(state);
+    std::vector<std::pair<double, int>> action_values;
+    for(int a : valid_actions)
+        action_values.emplace_back(q_values[a], a);
+    
+    return std::max_element(action_values.begin(), action_values.end())->second;
 }
 
-void SetColor(int color) {
-    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), color);
+bool check_win(const std::vector<std::vector<char>>& board, char player) {
+    auto check_line = [&](int r, int c, int dr, int dc) {
+        for(int i=0; i<4; ++i)
+            if(board[r + i*dr][c + i*dc] != player) return false;
+        return true;
+    };
+    
+    for(int r=0; r<ROWS; ++r)
+        for(int c=0; c<COLS-3; ++c)
+            if(check_line(r, c, 0, 1)) return true;
+    
+    for(int c=0; c<COLS; ++c)
+        for(int r=0; r<ROWS-3; ++r)
+            if(check_line(r, c, 1, 0)) return true;
+    
+    for(int r=0; r<ROWS-3; ++r)
+        for(int c=0; c<COLS-3; ++c)
+            if(check_line(r, c, 1, 1)) return true;
+    
+    for(int r=3; r<ROWS; ++r)
+        for(int c=0; c<COLS-3; ++c)
+            if(check_line(r, c, -1, 1)) return true;
+    
+    return false;
 }
 
-void ClearScreen() {
-    system("cls");
+void train_ai(int games) {
+    _mkdir("memory");
+    target_net = policy_net;
+    int update_counter = 0;
+    int wins = 0, losses = 0, draws = 0;
+    auto training_start = std::chrono::steady_clock::now();
+    
+    for(int game=0; game<games; ++game) {
+        std::vector<std::vector<char>> board(ROWS, std::vector<char>(COLS, ' '));
+        char current = 'Y';
+        std::vector<Experience> episode;
+        bool done = false;
+        char winner = ' ';
+        
+        while(!done) {
+            auto state = board_to_state(board);
+            int action = select_action(state, policy_net, true);
+            
+            if(action == -1) break;
+            int row = ROWS-1;
+            while(row >=0 && board[row][action] != ' ') row--;
+            board[row][action] = current;
+            
+            double reward = 0;
+            if(check_win(board, current)) {
+                reward = (current == 'Y') ? 1.0 : -1.0;
+                done = true;
+                winner = current;
+            }
+            else if(std::all_of(board[0].begin(), board[0].end(), 
+                [](char c) { return c != ' '; })) {
+                done = true;
+                draws++;
+            }
+            
+            auto next_state = board_to_state(board);
+            episode.push_back({state, action, reward, next_state, done});
+            current = (current == 'Y') ? 'R' : 'Y';
+        }
+        
+        if(winner == 'Y') wins++;
+        else if(winner == 'R') losses++;
+        
+        for(auto& exp : episode) {
+            if(memory.size() >= MEMORY_CAPACITY)
+                memory[gen() % MEMORY_CAPACITY] = exp;
+            else
+                memory.push_back(exp);
+        }
+        
+        if(memory.size() >= BATCH_SIZE) {
+            std::vector<Experience> batch;
+            std::sample(memory.begin(), memory.end(), std::back_inserter(batch),
+                       BATCH_SIZE, gen);
+            policy_net.update(target_net, batch);
+            policy_net.soft_update(target_net);
+        }
+        
+        epsilon = std::max(EPS_END, epsilon * EPS_DECAY);
+        
+        if((game+1) % 100 == 0) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - training_start).count();
+            double games_per_sec = 100.0 / (elapsed > 0 ? elapsed : 1);
+            
+            std::cout << "Game " << std::setw(6) << game+1 << "/" << games 
+                      << " | EPS: " << std::fixed << std::setprecision(4) << epsilon
+                      << " | W/L/D: " << wins << "/" << losses << "/" << draws
+                      << " | GPS: " << std::setprecision(1) << games_per_sec
+                      << " | Mem: " << memory.size() << "     \r";
+            std::cout.flush();
+            
+            wins = losses = draws = 0;
+            training_start = now;
+        }
+        
+        if((game+1) % 1000 == 0) {
+            policy_net.save("memory/policy.bin");
+            target_net.save("memory/target.bin");
+        }
+    }
+    std::cout << "\nTraining complete. Models saved to memory/\n";
 }
 
-void DisplayBoard() {
+int ai_move(const std::vector<std::vector<char>>& board) {
+    auto state = board_to_state(board);
+    return select_action(state, policy_net, false);
+}
+
+void display_board(const std::vector<std::vector<char>>& board) {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     std::cout << "\n";
-    for (int row = 0; row < ROWS; ++row) {
-        for (int col = 0; col < COLS; ++col) {
+    for(int r=0; r<ROWS; ++r) {
+        for(int c=0; c<COLS; ++c) {
             std::cout << "| ";
-            if (board[row][col] == 'R') SetColor(12);
-            else if (board[row][col] == 'Y') SetColor(14);
-            else SetColor(7);
-            std::cout << board[row][col];
-            SetColor(7);
+            if(board[r][c] == 'R') SetConsoleTextAttribute(hConsole, 12);
+            else if(board[r][c] == 'Y') SetConsoleTextAttribute(hConsole, 14);
+            std::cout << board[r][c];
+            SetConsoleTextAttribute(hConsole, 7);
             std::cout << " ";
         }
         std::cout << "|\n";
@@ -86,221 +379,72 @@ void DisplayBoard() {
     std::cout << "  1   2   3   4   5   6   7\n";
 }
 
-bool CheckWin(char player) {
-    for (const auto& line : winningLines) {
-        bool win = true;
-        for (const auto& pos : line)
-            if (board[pos.first][pos.second] != player) {
-                win = false;
-                break;
-            }
-        if (win) return true;
-    }
-    return false;
-}
-
-bool DropPiece(int col, char player) {
-    for (int row = ROWS-1; row >= 0; --row) {
-        if (board[row][col] == ' ') {
-            board[row][col] = player;
-            gameHash ^= zobristTable[row][col][player == 'Y'];
-            return true;
-        }
-    }
-    return false;
-}
-
-int EvaluateThreats(char player, bool currentTurn) {
-    char opponent = (player == 'R') ? 'Y' : 'R';
-    int score = 0;
-    
-    for (int col = 0; col < COLS; ++col) {
-        if (board[0][col] != ' ') continue;
-        int row = ROWS-1;
-        while (row >= 0 && board[row][col] != ' ') row--;
-        
-        board[row][col] = player;
-        if (CheckWin(player)) score += 5000000;
-        board[row][col] = ' ';
-        
-        board[row][col] = opponent;
-        if (CheckWin(opponent)) score -= 4000000;
-        board[row][col] = ' ';
-    }
-
-    for (const auto& line : winningLines) {
-        int playerCount = 0, opponentCount = 0, empty = 0;
-        for (const auto& pos : line) {
-            if (board[pos.first][pos.second] == player) playerCount++;
-            else if (board[pos.first][pos.second] == opponent) opponentCount++;
-            else empty++;
-        }
-        
-        if (playerCount == 3 && empty == 1) score += currentTurn ? 250000 : 125000;
-        if (opponentCount == 3 && empty == 1) score -= currentTurn ? 300000 : 150000;
-        if (playerCount == 2 && empty == 2) score += currentTurn ? 5000 : 2500;
-        if (opponentCount == 2 && empty == 2) score -= currentTurn ? 6000 : 3000;
-    }
-    
-    for (int col = 0; col < COLS; ++col)
-        score += CENTER_WEIGHTS[col] * (board[ROWS/2][col] == player ? 10 : 0);
-
-    return score;
-}
-
-int PVS(int depth, int alpha, int beta, bool maximizing, int ply) {
-    if (CheckWin('Y')) return WIN_SCORE - ply;
-    if (CheckWin('R')) return -WIN_SCORE + ply;
-    if (depth == 0) return EvaluateThreats('Y', !maximizing);
-
-    auto ttEntry = transpositionTable.find(gameHash);
-    if (ttEntry != transpositionTable.end() && ttEntry->second.depth >= depth) {
-        if (ttEntry->second.flag == 0) return ttEntry->second.score;
-        if (ttEntry->second.flag == 1 && ttEntry->second.score >= beta) return beta;
-        if (ttEntry->second.flag == 2 && ttEntry->second.score <= alpha) return alpha;
-    }
-
-    std::vector<std::pair<int, int>> moves;
-    for (int col = 0; col < COLS; ++col) {
-        if (board[0][col] != ' ') continue;
-        int priority = CENTER_WEIGHTS[col] * 10;
-        
-        int row = ROWS-1;
-        while (row >= 0 && board[row][col] != ' ') row--;
-        board[row][col] = 'R';
-        if (CheckWin('R')) priority += 1000000;
-        board[row][col] = ' ';
-        
-        moves.emplace_back(-priority, col);
-    }
-    std::sort(moves.begin(), moves.end());
-
-    int bestScore = -std::numeric_limits<int>::max();
-    int bestMove = moves.front().second;
-    int alphaOrig = alpha;
-
-    for (size_t i = 0; i < moves.size(); ++i) {
-        int col = moves[i].second;
-        int row = ROWS-1;
-        while (row >= 0 && board[row][col] != ' ') row--;
-        
-        board[row][col] = maximizing ? 'Y' : 'R';
-        gameHash ^= zobristTable[row][col][maximizing ? 1 : 0];
-        
-        int score;
-        if (i == 0) {
-            score = -PVS(depth-1, -beta, -alpha, !maximizing, ply+1);
-        } else {
-            score = -PVS(depth-1, -alpha-1, -alpha, !maximizing, ply+1);
-            if (score > alpha && score < beta)
-                score = -PVS(depth-1, -beta, -score, !maximizing, ply+1);
-        }
-        
-        board[row][col] = ' ';
-        gameHash ^= zobristTable[row][col][maximizing ? 1 : 0];
-        
-        if (score > bestScore) {
-            bestScore = score;
-            bestMove = col;
-        }
-        alpha = std::max(alpha, bestScore);
-        if (alpha >= beta) break;
-        
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - searchStart).count() > TIMEOUT_MS) {
-            timeout = true;
-            break;
-        }
-    }
-
-    TranspositionEntry entry;
-    entry.depth = depth;
-    entry.score = bestScore;
-    entry.flag = (bestScore <= alphaOrig) ? 2 : (bestScore >= beta) ? 1 : 0;
-    entry.key = gameHash;
-    transpositionTable[gameHash] = entry;
-
-    return bestScore;
-}
-
-int FindBestMove() {
-    transpositionTable.clear();
-    timeout = false;
-    searchStart = std::chrono::steady_clock::now();
-    int bestCol = 3, bestScore = -std::numeric_limits<int>::max();
-
-    for (int depth = 1; depth <= MAX_DEPTH && !timeout; ++depth) {
-        int currentBest = bestCol;
-        int currentScore = -std::numeric_limits<int>::max();
-        
-        std::vector<std::pair<int, int>> moves;
-        for (int col = 0; col < COLS; ++col) {
-            if (board[0][col] == ' ') {
-                int priority = CENTER_WEIGHTS[col] * 10;
-                if (col == bestCol) priority += 5000;
-                moves.emplace_back(-priority, col);
-            }
-        }
-        std::sort(moves.begin(), moves.end());
-
-        for (const auto& [priority, col] : moves) {
-            int row = ROWS-1;
-            while (row >= 0 && board[row][col] != ' ') row--;
-            
-            board[row][col] = 'Y';
-            gameHash ^= zobristTable[row][col][1];
-            int score = -PVS(depth-1, -std::numeric_limits<int>::max(), 
-                           -std::numeric_limits<int>::min(), false, 0);
-            board[row][col] = ' ';
-            gameHash ^= zobristTable[row][col][1];
-            
-            if (score > currentScore) {
-                currentScore = score;
-                currentBest = col;
-            }
-            if (timeout) break;
-        }
-        
-        if (!timeout) {
-            bestCol = currentBest;
-            bestScore = currentScore;
-        }
-    }
-    return bestCol;
-}
-
 int main() {
-    InitializeZobrist();
-    InitializeWinningLines();
-    std::cout << "Welcome to Connect 4 vs AI!\n";
-    std::cout << "Choose who starts:\n1. You (Red - R)\n2. AI (Yellow - Y)\nEnter 1 or 2: ";
+    std::cout << "1. Play\n2. Train\nChoice: ";
     int choice;
     std::cin >> choice;
-    currentPlayer = (choice == 1) ? 'R' : 'Y';
-
-    while (true) {
-        ClearScreen();
-        DisplayBoard();
+    
+    if(choice == 2) {
+        std::cout << "Training games: ";
+        int games;
+        std::cin >> games;
+        train_ai(games);
+        return 0;
+    }
+    
+    if(std::ifstream("memory/policy.bin")) {
+        policy_net.load("memory/policy.bin");
+        target_net.load("memory/target.bin");
+    }
+    
+    std::vector<std::vector<char>> board(ROWS, std::vector<char>(COLS, ' '));
+    std::cout << "Start as (1=Human, 2=AI): ";
+    std::cin >> choice;
+    char human = (choice == 1) ? 'R' : 'Y';
+    char ai = (human == 'R') ? 'Y' : 'R';
+    char current = 'R';
+    
+    while(true) {
+        system("cls");
+        display_board(board);
         
-        if (currentPlayer == 'R') {
+        if(current == human) {
             int move;
-            std::cout << "Your move (1-7): ";
-            std::cin >> move;
-            if (move < 1 || move > 7) continue;
-            if (!DropPiece(move-1, 'R')) continue;
-        } else {
-            int aiMove = FindBestMove();
-            DropPiece(aiMove, 'Y');
+            do {
+                std::cout << "Column (1-7): ";
+                std::cin >> move;
+                move--;
+            } while(move < 0 || move >= COLS || board[0][move] != ' ');
+            
+            int row = ROWS-1;
+            while(row >=0 && board[row][move] != ' ') row--;
+            board[row][move] = human;
+        }
+        else {
+            int move = ai_move(board);
+            int row = ROWS-1;
+            while(row >=0 && board[row][move] != ' ') row--;
+            board[row][move] = ai;
         }
         
-        if (CheckWin(currentPlayer)) {
-            ClearScreen();
-            DisplayBoard();
-            std::cout << (currentPlayer == 'R' ? "You win!" : "AI wins!") << "\n";
+        if(check_win(board, current)) {
+            system("cls");
+            display_board(board);
+            std::cout << (current == human ? "Human" : "AI") << " wins!\n";
             break;
         }
-        currentPlayer = (currentPlayer == 'R') ? 'Y' : 'R';
+        
+        if(std::all_of(board[0].begin(), board[0].end(), 
+            [](char c) { return c != ' '; })) {
+            system("cls");
+            display_board(board);
+            std::cout << "Draw!\n";
+            break;
+        }
+        
+        current = (current == 'R') ? 'Y' : 'R';
     }
+    
     system("pause");
     return 0;
 }
