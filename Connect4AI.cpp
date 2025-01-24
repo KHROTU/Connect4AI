@@ -6,12 +6,15 @@
 #include <cmath>
 #include <chrono>
 #include <random>
+#include <windows.h>
 
 constexpr int ROWS = 6;
 constexpr int COLS = 7;
-constexpr int MCTS_SIMS = 400;
-constexpr int MAX_DEPTH = 5;
-constexpr float C_PUCT = 1.5f;
+constexpr int MCTS_SIMS = 1000;
+constexpr int MAX_DEPTH = 8;
+constexpr float C_PUCT = 2.2f;
+
+HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
 
 struct MCTSNode {
     MCTSNode* parent;
@@ -27,22 +30,18 @@ struct MCTSNode {
 class GameState {
 private:
     std::vector<std::vector<char>> board;
-    std::mt19937 gen{std::random_device{}()};
-
-    bool check_win(int row, int col, char player) const {
-        const int dirs[4][2] = {{0,1}, {1,0}, {1,1}, {-1,1}};
-        for (auto [dr, dc] : dirs) {
-            int count = 1;
-            for (int d = -1; d <= 1; d += 2) {
-                for (int i = 1; ; i++) {
-                    int r = row + dr * i * d;
-                    int c = col + dc * i * d;
-                    if (r < 0 || r >= ROWS || c < 0 || c >= COLS || board[r][c] != player) break;
-                    if (++count >= 4) return true;
-                }
+    
+    bool check_pattern(int r, int c, int dr, int dc, char player, int length) const {
+        int count = 0;
+        for (int i = 0; i < 4; ++i) {
+            int nr = r + dr * i;
+            int nc = c + dc * i;
+            if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS) {
+                if (board[nr][nc] == player) count++;
+                else if (board[nr][nc] != ' ') return false;
             }
         }
-        return false;
+        return count >= length;
     }
 
 public:
@@ -59,10 +58,44 @@ public:
         for (int r = ROWS-1; r >= 0; --r) {
             if (board[r][col] == ' ') {
                 board[r][col] = player;
-                return check_win(r, col, player);
+                return check_win(r, col);
             }
         }
         return false;
+    }
+
+    bool check_win(int r, int c) const {
+        const int dirs[4][2] = {{0,1}, {1,0}, {1,1}, {-1,1}};
+        for (auto [dr, dc] : dirs) {
+            if (check_pattern(r, c, dr, dc, board[r][c], 4)) return true;
+        }
+        return false;
+    }
+
+    bool would_win(int col, char player) const {
+        GameState temp = *this;
+        return temp.make_move(col, player);
+    }
+
+    int detect_threats(char opponent, int required) const {
+        const int dirs[4][2] = {{0,1}, {1,0}, {1,1}, {-1,1}};
+        
+        for (int c = 0; c < COLS; ++c) {
+            if (board[0][c] != ' ') continue;
+            
+            // Find landing row
+            int r = ROWS-1;
+            while (r >= 0 && board[r][c] != ' ') r--;
+            
+            // Check if this move creates a threat
+            for (auto [dr, dc] : dirs) {
+                if (check_pattern(r, c, dr, dc, opponent, required) ||
+                    check_pattern(r, c, -dr, -dc, opponent, required)) {
+                    return c;
+                }
+            }
+        }
+        return -1;
     }
 
     void undo_move(int col) {
@@ -81,11 +114,12 @@ class MCTS {
 private:
     std::unique_ptr<MCTSNode> root;
     GameState state;
-
+    std::mt19937 gen;
+    
     float ucb_score(const MCTSNode* node) const {
         if (node->visit_count == 0) return INFINITY;
         return (node->value_sum / node->visit_count) + 
-               C_PUCT * node->prior * std::sqrt(root->visit_count) / (1 + node->visit_count);
+               C_PUCT * node->prior * std::sqrt(node->parent->visit_count) / (1 + node->visit_count);
     }
 
     MCTSNode* select(MCTSNode* node) {
@@ -116,9 +150,27 @@ private:
             auto moves = sim_state.get_valid_moves();
             if (moves.empty()) return 0.0f;
             
+            for (int move : moves) {
+                if (sim_state.would_win(move, current)) 
+                    return current == 'Y' ? 1.0f : -1.0f;
+            }
+            
+            int threat = sim_state.detect_threats(current == 'Y' ? 'R' : 'Y', 3);
+            if (threat != -1 && std::find(moves.begin(), moves.end(), threat) != moves.end()) {
+                sim_state.make_move(threat, current);
+                current = current == 'Y' ? 'R' : 'Y';
+                continue;
+            }
+
+            threat = sim_state.detect_threats(current == 'Y' ? 'R' : 'Y', 2);
+            if (threat != -1 && std::find(moves.begin(), moves.end(), threat) != moves.end()) {
+                sim_state.make_move(threat, current);
+                current = current == 'Y' ? 'R' : 'Y';
+                continue;
+            }
+
             int move = moves[dist(gen) % moves.size()];
-            bool win = sim_state.make_move(move, current);
-            if (win) return current == 'Y' ? 1.0f : -1.0f;
+            sim_state.make_move(move, current);
             current = current == 'Y' ? 'R' : 'Y';
         }
         return 0.0f;
@@ -134,9 +186,12 @@ private:
     }
 
 public:
+    MCTS() : gen(std::random_device{}()) {}
+    
     int search(const GameState& game_state) {
         state = game_state;
         root = std::make_unique<MCTSNode>();
+        expand(root.get());
         
         for (int i = 0; i < MCTS_SIMS; ++i) {
             MCTSNode* node = select(root.get());
@@ -160,20 +215,28 @@ public:
     }
 };
 
-int minimax(GameState& state, int depth, float alpha, float beta, bool maximizing) {
-    if (depth == 0) return 0;
-    
+int minimax(GameState& state, int depth, int alpha, int beta, bool maximizing) {
     auto moves = state.get_valid_moves();
-    if (moves.empty()) return 0;
+    if (moves.empty() || depth == 0) return 0;
 
-    int best_value = maximizing ? -1000 : 1000;
+    int best_value = maximizing ? -100000 : 100000;
     char player = maximizing ? 'Y' : 'R';
+
+    int threat = state.detect_threats(maximizing ? 'R' : 'Y', 3);
+    if (threat != -1 && depth >= 2) {
+        return maximizing ? -95000 : 95000;
+    }
+
+    threat = state.detect_threats(maximizing ? 'R' : 'Y', 2);
+    if (threat != -1 && depth >= 4) {
+        return maximizing ? -90000 : 90000;
+    }
 
     for (int move : moves) {
         bool win = state.make_move(move, player);
         if (win) {
             state.undo_move(move);
-            return maximizing ? 1000 : -1000;
+            return maximizing ? 100000 : -100000;
         }
         
         int value = minimax(state, depth-1, alpha, beta, !maximizing);
@@ -181,10 +244,10 @@ int minimax(GameState& state, int depth, float alpha, float beta, bool maximizin
 
         if (maximizing) {
             best_value = std::max(best_value, value);
-            alpha = std::max(alpha, (float)value);
+            alpha = std::max(alpha, value);
         } else {
             best_value = std::min(best_value, value);
-            beta = std::min(beta, (float)value);
+            beta = std::min(beta, value);
         }
         
         if (beta <= alpha) break;
@@ -193,19 +256,32 @@ int minimax(GameState& state, int depth, float alpha, float beta, bool maximizin
 }
 
 int hybrid_decision(const GameState& state) {
-    // MCTS decision
+    auto moves = state.get_valid_moves();
+    if (moves.empty()) return -1;
+
+    for (int move : moves) {
+        if (state.would_win(move, 'Y')) return move;
+    }
+
+    for (int move : moves) {
+        if (state.would_win(move, 'R')) return move;
+    }
+
+    int threat = state.detect_threats('R', 3);
+    if (threat != -1) return threat;
+
+    threat = state.detect_threats('R', 2);
+    if (threat != -1) return threat;
+
     MCTS mcts;
-    int mcts_move = mcts.search(state);
-    
-    // Minimax decision
     GameState mm_state = state;
-    int best_mm = -1000;
-    int mm_move = -1;
-    auto moves = mm_state.get_valid_moves();
+    
+    int best_mm = -100000;
+    int mm_move = moves[0];
     
     for (int move : moves) {
         mm_state.make_move(move, 'Y');
-        int score = minimax(mm_state, MAX_DEPTH, -1000, 1000, false);
+        int score = minimax(mm_state, MAX_DEPTH, -100000, 100000, false);
         mm_state.undo_move(move);
         
         if (score > best_mm) {
@@ -214,60 +290,79 @@ int hybrid_decision(const GameState& state) {
         }
     }
 
-    // Combine results
-    return (best_mm >= 500) ? mm_move : mcts_move;
+    return (best_mm >= 50000) ? mm_move : mcts.search(state);
+}
+
+void display_board(const GameState& state) {
+    const auto& board = state.get_board();
+    system("cls");
+    
+    for (int r = 0; r < ROWS; ++r) {
+        for (int c = 0; c < COLS; ++c) {
+            std::cout << "| ";
+            char piece = board[r][c];
+            if (piece != ' ') {
+                SetConsoleTextAttribute(hConsole, piece == 'R' ? 12 : 14);
+                std::cout << piece;
+                SetConsoleTextAttribute(hConsole, 7);
+            } else {
+                std::cout << ' ';
+            }
+            std::cout << ' ';
+        }
+        std::cout << "|\n";
+    }
+    
+    std::cout << "+---+---+---+---+---+---+---+\n";
+    std::cout << "  1   2   3   4   5   6   7\n";
 }
 
 int main() {
     GameState state;
-    char human = 'R';
-    char ai = 'Y';
     char current = 'R';
 
     while (true) {
-        system("cls");
-        const auto& board = state.get_board();
-        
-        for (int r = 0; r < ROWS; ++r) {
-            for (int c = 0; c < COLS; ++c)
-                std::cout << "| " << board[r][c] << " ";
-            std::cout << "|\n";
+        display_board(state);
+        auto moves = state.get_valid_moves();
+        if (moves.empty()) {
+            std::cout << "Game Over! It's a draw!\n";
+            break;
         }
-        std::cout << "+---+---+---+---+---+---+---+\n";
 
-        if (current == human) {
+        if (current == 'R') {
             int move;
             do {
-                std::cout << "Column (1-7): ";
+                std::cout << "Your move (1-7): ";
                 std::cin >> move;
                 move--;
-            } while (move < 0 || move >= COLS || state.get_valid_moves()[move] != move);
+            } while (move < 0 || move >= COLS || 
+                     std::find(moves.begin(), moves.end(), move) == moves.end());
             
-            if (state.make_move(move, human)) {
-                std::cout << "Human wins!\n";
-                break;
+            if (state.make_move(move, 'R')) {
+                display_board(state);
+                std::cout << "Congratulations! You win!\n";
+                system("pause");
+                return 0;
             }
         } else {
             auto start = std::chrono::high_resolution_clock::now();
             int move = hybrid_decision(state);
             auto end = std::chrono::high_resolution_clock::now();
             
-            std::cout << "AI chose: " << (move+1) << " (" 
-                      << std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count()
-                      << "ms)\n";
-            
-            if (state.make_move(move, ai)) {
+            if (state.make_move(move, 'Y')) {
+                display_board(state);
                 std::cout << "AI wins!\n";
-                break;
+                system("pause");
+                return 0;
             }
+            
+            std::cout << "AI chose column " << (move+1) 
+                      << " (" << std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count()
+                      << "ms)\n";
         }
 
-        if (state.get_valid_moves().empty()) {
-            std::cout << "Draw!\n";
-            break;
-        }
-
-        current = (current == human) ? ai : human;
+        current = (current == 'R') ? 'Y' : 'R';
     }
+    system("pause");
     return 0;
 }
