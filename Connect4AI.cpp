@@ -12,9 +12,9 @@
 const int ROWS = 6;
 const int COLS = 7;
 const int WIN_SCORE = 100000000;
-const int MAX_DEPTH = 12;
+const int MAX_DEPTH = 16;
 const int CENTER_WEIGHTS[COLS] = {1, 3, 6, 9, 6, 3, 1};
-const int TIMEOUT_MS = 8500;
+const int TIMEOUT_MS = 10000;
 
 struct TranspositionEntry {
     int depth;
@@ -120,11 +120,11 @@ int EvaluateThreats(char player, bool currentTurn) {
         while (row >= 0 && board[row][col] != ' ') row--;
         
         board[row][col] = player;
-        if (CheckWin(player)) score += 5000000;
+        if (CheckWin(player)) score += WIN_SCORE;
         board[row][col] = ' ';
         
         board[row][col] = opponent;
-        if (CheckWin(opponent)) score -= 4000000;
+        if (CheckWin(opponent)) score -= WIN_SCORE;
         board[row][col] = ' ';
     }
 
@@ -151,7 +151,7 @@ int EvaluateThreats(char player, bool currentTurn) {
 int PVS(int depth, int alpha, int beta, bool maximizing, int ply) {
     if (CheckWin('Y')) return WIN_SCORE - ply;
     if (CheckWin('R')) return -WIN_SCORE + ply;
-    if (depth == 0) return EvaluateThreats('Y', !maximizing);
+    if (depth == 0) return EvaluateThreats(maximizing ? 'Y' : 'R', maximizing);
 
     auto ttEntry = transpositionTable.find(gameHash);
     if (ttEntry != transpositionTable.end() && ttEntry->second.depth >= depth) {
@@ -161,14 +161,15 @@ int PVS(int depth, int alpha, int beta, bool maximizing, int ply) {
     }
 
     std::vector<std::pair<int, int>> moves;
+    char currentPlayerSymbol = maximizing ? 'Y' : 'R';
     for (int col = 0; col < COLS; ++col) {
         if (board[0][col] != ' ') continue;
         int priority = CENTER_WEIGHTS[col] * 10;
         
         int row = ROWS-1;
         while (row >= 0 && board[row][col] != ' ') row--;
-        board[row][col] = 'R';
-        if (CheckWin('R')) priority += 1000000;
+        board[row][col] = currentPlayerSymbol;
+        if (CheckWin(currentPlayerSymbol)) priority += 10000000;
         board[row][col] = ' ';
         
         moves.emplace_back(-priority, col);
