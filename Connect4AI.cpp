@@ -1,424 +1,305 @@
 #define NOMINMAX
 #include <iostream>
 #include <vector>
+#include <unordered_map>
+#include <windows.h>
+#include <limits>
 #include <algorithm>
-#include <memory>
-#include <cmath>
 #include <chrono>
 #include <random>
-#include <windows.h>
+#include <bitset>
 
-constexpr int ROWS = 6;
-constexpr int COLS = 7;
-constexpr int MCTS_SIMS = 1200;
-constexpr int MAX_DEPTH = 9;
-constexpr float C_PUCT = 2.4f;
+const int ROWS = 6;
+const int COLS = 7;
+const int WIN_SCORE = 100000000;
+const int MAX_DEPTH = 12;
+const int CENTER_WEIGHTS[COLS] = {1, 3, 6, 9, 6, 3, 1};
+const int TIMEOUT_MS = 8500;
 
-HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-const WORD PLAYER_COLOR = 12;
-const WORD AI_COLOR = 14;
-const WORD BOARD_COLOR = 7;
-
-struct MCTSNode {
-    MCTSNode* parent;
-    std::vector<std::unique_ptr<MCTSNode>> children;
-    std::vector<int> valid_moves;
-    int visit_count = 0;
-    float value_sum = 0;
-    float prior = 0;
-    
-    explicit MCTSNode(MCTSNode* p = nullptr) : parent(p) {}
+struct TranspositionEntry {
+    int depth;
+    int score;
+    int flag;
+    uint64_t key;
 };
 
-class GameState {
-private:
-    std::vector<std::vector<char>> board;
+std::vector<std::vector<char>> board(ROWS, std::vector<char>(COLS, ' '));
+std::unordered_map<uint64_t, TranspositionEntry> transpositionTable;
+char currentPlayer = 'R';
+std::vector<std::vector<std::pair<int, int>>> winningLines;
+std::chrono::time_point<std::chrono::steady_clock> searchStart;
+bool timeout = false;
+
+uint64_t zobristTable[ROWS][COLS][2];
+uint64_t gameHash = 0;
+
+void InitializeZobrist() {
+    std::mt19937_64 gen(0xDEADBEEF);
+    for (int i = 0; i < ROWS; ++i)
+        for (int j = 0; j < COLS; ++j)
+            for (int k = 0; k < 2; ++k)
+                zobristTable[i][j][k] = gen();
+}
+
+void InitializeWinningLines() {
+    winningLines.clear();
+    for (int row = 0; row < ROWS; ++row)
+        for (int col = 0; col <= COLS-4; ++col)
+            winningLines.push_back({{row,col}, {row,col+1}, {row,col+2}, {row,col+3}});
     
-    bool check_line(int r, int c, int dr, int dc, char player, int length) const {
-        int count = 0;
-        for (int i = -3; i <= 3; ++i) {
-            int nr = r + dr*i;
-            int nc = c + dc*i;
-            if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS) {
-                if (board[nr][nc] == player) {
-                    if (++count >= length) return true;
-                } else if (board[nr][nc] != ' ') {
-                    count = 0;
-                }
-            }
-        }
-        return false;
-    }
-
-public:
-    GameState() : board(ROWS, std::vector<char>(COLS, ' ')) {}
-
-    std::vector<int> get_valid_moves() const {
-        std::vector<int> moves;
-        for (int c = 0; c < COLS; ++c)
-            if (board[0][c] == ' ') moves.push_back(c);
-        return moves;
-    }
-
-    bool make_move(int col, char player) {
-        for (int r = ROWS-1; r >= 0; --r) {
-            if (board[r][col] == ' ') {
-                board[r][col] = player;
-                return check_win(r, col);
-            }
-        }
-        return false;
-    }
-
-    bool check_win(int r, int c) const {
-        const int dirs[4][2] = {{0,1}, {1,0}, {1,1}, {-1,1}};
-        for (auto [dr, dc] : dirs) {
-            if (check_line(r, c, dr, dc, board[r][c], 4)) return true;
-        }
-        return false;
-    }
-
-    bool would_win(int col, char player) const {
-        GameState temp = *this;
-        return temp.make_move(col, player);
-    }
-
-    int threat_scan(char opponent) const {
-        const int dirs[4][2] = {{0,1}, {1,0}, {1,1}, {-1,1}};
-        
-        for (int c = 0; c < COLS; ++c) {
-            if (board[0][c] != ' ') continue;
-            
-            int r = ROWS-1;
-            while (r >= 0 && board[r][c] != ' ') r--;
-            
-            for (auto [dr, dc] : dirs) {
-                if (check_line(r, c, dr, dc, opponent, 3) ||
-                    check_line(r, c, -dr, -dc, opponent, 3))
-                    return c;
-            }
-        }
-        return -1;
-    }
-
-    int evaluate_position(char player) const {
-        int score = 0;
-        const int dirs[4][2] = {{0,1}, {1,0}, {1,1}, {-1,1}};
-        
-        for (int r = 0; r < ROWS; ++r) {
-            for (int c = 0; c < COLS; ++c) {
-                if (board[r][c] == player) {
-                    for (auto [dr, dc] : dirs) {
-                        int sequence = 1;
-                        bool open_start = true, open_end = true;
-                        
-                        for (int i = 1; i < 4; ++i) {
-                            int nr = r - dr*i;
-                            int nc = c - dc*i;
-                            if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) open_start = false;
-                        }
-                        
-                        for (int i = 1; i < 4; ++i) {
-                            int nr = r + dr*i;
-                            int nc = c + dc*i;
-                            if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS) {
-                                if (board[nr][nc] == player) sequence++;
-                                else if (board[nr][nc] != ' ') open_end = false;
-                            } else {
-                                open_end = false;
-                            }
-                        }
-                        
-                        if (sequence >= 2) {
-                            int weight = open_start + open_end;
-                            score += (sequence == 2) ? weight * 10 : 
-                                    (sequence == 3) ? weight * 100 : 1000;
-                        }
-                    }
-                }
-            }
-        }
-        return score;
-    }
-
-    void undo_move(int col) {
-        for (int r = 0; r < ROWS; ++r) {
-            if (board[r][col] != ' ') {
-                board[r][col] = ' ';
-                return;
-            }
-        }
-    }
-
-    const auto& get_board() const { return board; }
-};
-
-class MCTS {
-private:
-    std::unique_ptr<MCTSNode> root;
-    GameState state;
-    std::mt19937 gen;
+    for (int col = 0; col < COLS; ++col)
+        for (int row = 0; row <= ROWS-4; ++row)
+            winningLines.push_back({{row,col}, {row+1,col}, {row+2,col}, {row+3,col}});
     
-    float ucb_score(const MCTSNode* node) const {
-        if (node->visit_count == 0) return INFINITY;
-        return (node->value_sum / node->visit_count) + 
-               C_PUCT * node->prior * std::sqrt(node->parent->visit_count) / (1 + node->visit_count);
-    }
+    for (int row = 0; row <= ROWS-4; ++row)
+        for (int col = 0; col <= COLS-4; ++col)
+            winningLines.push_back({{row,col}, {row+1,col+1}, {row+2,col+2}, {row+3,col+3}});
+    
+    for (int row = 3; row < ROWS; ++row)
+        for (int col = 0; col <= COLS-4; ++col)
+            winningLines.push_back({{row,col}, {row-1,col+1}, {row-2,col+2}, {row-3,col+3}});
+}
 
-    MCTSNode* select(MCTSNode* node) {
-        while (!node->children.empty()) {
-            auto best = std::max_element(node->children.begin(), node->children.end(),
-                [&](const auto& a, const auto& b) { return ucb_score(a.get()) < ucb_score(b.get()); });
-            node = best->get();
+void SetColor(int color) {
+    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), color);
+}
+
+void ClearScreen() {
+    system("cls");
+}
+
+void DisplayBoard() {
+    std::cout << "\n";
+    for (int row = 0; row < ROWS; ++row) {
+        for (int col = 0; col < COLS; ++col) {
+            std::cout << "| ";
+            if (board[row][col] == 'R') SetColor(12);
+            else if (board[row][col] == 'Y') SetColor(14);
+            else SetColor(7);
+            std::cout << board[row][col];
+            SetColor(7);
+            std::cout << " ";
         }
-        return node;
+        std::cout << "|\n";
     }
+    std::cout << "+---+---+---+---+---+---+---+\n";
+    std::cout << "  1   2   3   4   5   6   7\n";
+}
 
-    void expand(MCTSNode* node) {
-        auto moves = state.get_valid_moves();
-        node->valid_moves = moves;
-        for (int move : moves) {
-            auto child = std::make_unique<MCTSNode>(node);
-            child->prior = 1.0f / moves.size();
-            node->children.push_back(std::move(child));
-        }
-    }
-
-    float simulate() {
-        GameState sim_state = state;
-        char current = 'Y';
-        std::uniform_int_distribution<int> dist(0, COLS-1);
-        
-        for (int i = 0; i < 15; ++i) {
-            auto moves = sim_state.get_valid_moves();
-            if (moves.empty()) return 0.0f;
-            
-            for (int move : moves) {
-                if (sim_state.would_win(move, current)) 
-                    return current == 'Y' ? 1.0f : -1.0f;
-            }
-            
-            int threat = sim_state.threat_scan(current == 'Y' ? 'R' : 'Y');
-            if (threat != -1) {
-                sim_state.make_move(threat, current);
-                current = current == 'Y' ? 'R' : 'Y';
-                continue;
-            }
-
-            int best_move = -1;
-            int best_score = -1;
-            for (int move : moves) {
-                int score = sim_state.evaluate_position(current);
-                if (score > best_score) {
-                    best_score = score;
-                    best_move = move;
-                }
-            }
-            
-            if (best_move != -1) {
-                sim_state.make_move(best_move, current);
-                current = current == 'Y' ? 'R' : 'Y';
-            } else {
+bool CheckWin(char player) {
+    for (const auto& line : winningLines) {
+        bool win = true;
+        for (const auto& pos : line)
+            if (board[pos.first][pos.second] != player) {
+                win = false;
                 break;
             }
-        }
-        return 0.0f;
+        if (win) return true;
     }
+    return false;
+}
 
-    void backpropagate(MCTSNode* node, float value) {
-        while (node) {
-            node->visit_count++;
-            node->value_sum += value;
-            value = -value;
-            node = node->parent;
+bool DropPiece(int col, char player) {
+    for (int row = ROWS-1; row >= 0; --row) {
+        if (board[row][col] == ' ') {
+            board[row][col] = player;
+            gameHash ^= zobristTable[row][col][player == 'Y'];
+            return true;
         }
     }
+    return false;
+}
 
-public:
-    MCTS() : gen(std::random_device{}()) {}
+int EvaluateThreats(char player, bool currentTurn) {
+    char opponent = (player == 'R') ? 'Y' : 'R';
+    int score = 0;
     
-    int search(const GameState& game_state) {
-        state = game_state;
-        root = std::make_unique<MCTSNode>();
-        expand(root.get());
+    for (int col = 0; col < COLS; ++col) {
+        if (board[0][col] != ' ') continue;
+        int row = ROWS-1;
+        while (row >= 0 && board[row][col] != ' ') row--;
         
-        for (int i = 0; i < MCTS_SIMS; ++i) {
-            MCTSNode* node = select(root.get());
-            
-            if (node->visit_count == 0) {
-                float value = simulate();
-                backpropagate(node, value);
-            } else {
-                expand(node);
-                if (!node->children.empty()) {
-                    float value = simulate();
-                    backpropagate(node->children[0].get(), value);
-                }
+        board[row][col] = player;
+        if (CheckWin(player)) score += 5000000;
+        board[row][col] = ' ';
+        
+        board[row][col] = opponent;
+        if (CheckWin(opponent)) score -= 4000000;
+        board[row][col] = ' ';
+    }
+
+    for (const auto& line : winningLines) {
+        int playerCount = 0, opponentCount = 0, empty = 0;
+        for (const auto& pos : line) {
+            if (board[pos.first][pos.second] == player) playerCount++;
+            else if (board[pos.first][pos.second] == opponent) opponentCount++;
+            else empty++;
+        }
+        
+        if (playerCount == 3 && empty == 1) score += currentTurn ? 250000 : 125000;
+        if (opponentCount == 3 && empty == 1) score -= currentTurn ? 300000 : 150000;
+        if (playerCount == 2 && empty == 2) score += currentTurn ? 5000 : 2500;
+        if (opponentCount == 2 && empty == 2) score -= currentTurn ? 6000 : 3000;
+    }
+    
+    for (int col = 0; col < COLS; ++col)
+        score += CENTER_WEIGHTS[col] * (board[ROWS/2][col] == player ? 10 : 0);
+
+    return score;
+}
+
+int PVS(int depth, int alpha, int beta, bool maximizing, int ply) {
+    if (CheckWin('Y')) return WIN_SCORE - ply;
+    if (CheckWin('R')) return -WIN_SCORE + ply;
+    if (depth == 0) return EvaluateThreats('Y', !maximizing);
+
+    auto ttEntry = transpositionTable.find(gameHash);
+    if (ttEntry != transpositionTable.end() && ttEntry->second.depth >= depth) {
+        if (ttEntry->second.flag == 0) return ttEntry->second.score;
+        if (ttEntry->second.flag == 1 && ttEntry->second.score >= beta) return beta;
+        if (ttEntry->second.flag == 2 && ttEntry->second.score <= alpha) return alpha;
+    }
+
+    std::vector<std::pair<int, int>> moves;
+    for (int col = 0; col < COLS; ++col) {
+        if (board[0][col] != ' ') continue;
+        int priority = CENTER_WEIGHTS[col] * 10;
+        
+        int row = ROWS-1;
+        while (row >= 0 && board[row][col] != ' ') row--;
+        board[row][col] = 'R';
+        if (CheckWin('R')) priority += 1000000;
+        board[row][col] = ' ';
+        
+        moves.emplace_back(-priority, col);
+    }
+    std::sort(moves.begin(), moves.end());
+
+    int bestScore = -std::numeric_limits<int>::max();
+    int bestMove = moves.front().second;
+    int alphaOrig = alpha;
+
+    for (size_t i = 0; i < moves.size(); ++i) {
+        int col = moves[i].second;
+        int row = ROWS-1;
+        while (row >= 0 && board[row][col] != ' ') row--;
+        
+        board[row][col] = maximizing ? 'Y' : 'R';
+        gameHash ^= zobristTable[row][col][maximizing ? 1 : 0];
+        
+        int score;
+        if (i == 0) {
+            score = -PVS(depth-1, -beta, -alpha, !maximizing, ply+1);
+        } else {
+            score = -PVS(depth-1, -alpha-1, -alpha, !maximizing, ply+1);
+            if (score > alpha && score < beta)
+                score = -PVS(depth-1, -beta, -score, !maximizing, ply+1);
+        }
+        
+        board[row][col] = ' ';
+        gameHash ^= zobristTable[row][col][maximizing ? 1 : 0];
+        
+        if (score > bestScore) {
+            bestScore = score;
+            bestMove = col;
+        }
+        alpha = std::max(alpha, bestScore);
+        if (alpha >= beta) break;
+        
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - searchStart).count() > TIMEOUT_MS) {
+            timeout = true;
+            break;
+        }
+    }
+
+    TranspositionEntry entry;
+    entry.depth = depth;
+    entry.score = bestScore;
+    entry.flag = (bestScore <= alphaOrig) ? 2 : (bestScore >= beta) ? 1 : 0;
+    entry.key = gameHash;
+    transpositionTable[gameHash] = entry;
+
+    return bestScore;
+}
+
+int FindBestMove() {
+    transpositionTable.clear();
+    timeout = false;
+    searchStart = std::chrono::steady_clock::now();
+    int bestCol = 3, bestScore = -std::numeric_limits<int>::max();
+
+    for (int depth = 1; depth <= MAX_DEPTH && !timeout; ++depth) {
+        int currentBest = bestCol;
+        int currentScore = -std::numeric_limits<int>::max();
+        
+        std::vector<std::pair<int, int>> moves;
+        for (int col = 0; col < COLS; ++col) {
+            if (board[0][col] == ' ') {
+                int priority = CENTER_WEIGHTS[col] * 10;
+                if (col == bestCol) priority += 5000;
+                moves.emplace_back(-priority, col);
             }
         }
+        std::sort(moves.begin(), moves.end());
 
-        auto best = std::max_element(root->children.begin(), root->children.end(),
-            [](const auto& a, const auto& b) { return a->visit_count < b->visit_count; });
-        
-        return root->valid_moves[std::distance(root->children.begin(), best)];
-    }
-};
-
-int minimax(GameState& state, int depth, int alpha, int beta, bool maximizing) {
-    auto moves = state.get_valid_moves();
-    if (moves.empty() || depth == 0) 
-        return state.evaluate_position('Y') - state.evaluate_position('R');
-
-    if (maximizing) {
-        int value = -1000000;
-        for (int move : moves) {
-            GameState temp = state;
-            temp.make_move(move, 'Y');
-            value = std::max(value, minimax(temp, depth-1, alpha, beta, false));
-            alpha = std::max(alpha, value);
-            if (beta <= alpha) break;
-        }
-        return value;
-    } else {
-        int value = 1000000;
-        for (int move : moves) {
-            GameState temp = state;
-            temp.make_move(move, 'R');
-            value = std::min(value, minimax(temp, depth-1, alpha, beta, true));
-            beta = std::min(beta, value);
-            if (beta <= alpha) break;
-        }
-        return value;
-    }
-}
-
-int hybrid_decision(const GameState& state) {
-    auto moves = state.get_valid_moves();
-    if (moves.empty()) return -1;
-
-    // Immediate win check using const method
-    for (int move : moves) {
-        if (state.would_win(move, 'Y')) {
-            return move;
-        }
-    }
-
-    // Block opponent win using const method
-    for (int move : moves) {
-        if (state.would_win(move, 'R')) {
-            return move;
-        }
-    }
-
-    // Block threats using const method
-    int threat = state.threat_scan('R');
-    if (threat != -1) return threat;
-
-    MCTS mcts;
-    GameState mm_state = state;
-    
-    int best_score = -1000000;
-    int best_move = moves[0];
-    
-    for (int move : moves) {
-        GameState temp = mm_state;
-        temp.make_move(move, 'Y');
-        int score = minimax(temp, MAX_DEPTH, -1000000, 1000000, false);
-        
-        if (score > best_score) {
-            best_score = score;
-            best_move = move;
-        }
-    }
-
-    return (best_score >= 5000) ? best_move : mcts.search(state);
-}
-
-void display_board(const GameState& state) {
-    const auto& board = state.get_board();
-    system("cls");
-    
-    SetConsoleTextAttribute(hConsole, BOARD_COLOR);
-    std::cout << "\n  ";
-    for (int c = 0; c < COLS; ++c)
-        std::cout << "----";
-    std::cout << "-\n";
-    
-    for (int r = 0; r < ROWS; ++r) {
-        std::cout << "  |";
-        for (int c = 0; c < COLS; ++c) {
-            char piece = board[r][c];
-            if (piece == 'R') SetConsoleTextAttribute(hConsole, PLAYER_COLOR);
-            else if (piece == 'Y') SetConsoleTextAttribute(hConsole, AI_COLOR);
-            else SetConsoleTextAttribute(hConsole, BOARD_COLOR);
+        for (const auto& [priority, col] : moves) {
+            int row = ROWS-1;
+            while (row >= 0 && board[row][col] != ' ') row--;
             
-            std::cout << " " << piece << " ";
-            SetConsoleTextAttribute(hConsole, BOARD_COLOR);
-            std::cout << "|";
+            board[row][col] = 'Y';
+            gameHash ^= zobristTable[row][col][1];
+            int score = -PVS(depth-1, -std::numeric_limits<int>::max(), 
+                           std::numeric_limits<int>::max(), false, 0);
+            board[row][col] = ' ';
+            gameHash ^= zobristTable[row][col][1];
+            
+            if (score > currentScore) {
+                currentScore = score;
+                currentBest = col;
+            }
+            if (timeout) break;
         }
-        std::cout << "\n  ";
-        for (int c = 0; c < COLS; ++c)
-            std::cout << "----";
-        std::cout << "-\n";
+        
+        if (!timeout) {
+            bestCol = currentBest;
+            bestScore = currentScore;
+        }
     }
-    
-    SetConsoleTextAttribute(hConsole, BOARD_COLOR);
-    std::cout << "   ";
-    for (int c = 0; c < COLS; ++c)
-        std::cout << " " << c+1 << "  ";
-    std::cout << "\n\n";
+    return bestCol;
 }
 
 int main() {
-    SetConsoleTextAttribute(hConsole, BOARD_COLOR);
-    std::cout << "CONNECT 4 - AI EDITION\n";
-    std::cout << "1. Player First\n2. AI First\nChoice: ";
-    
+    InitializeZobrist();
+    InitializeWinningLines();
+    std::cout << "Welcome to Connect 4 vs AI!\n";
+    std::cout << "Choose who starts:\n1. You (Red - R)\n2. AI (Yellow - Y)\nEnter 1 or 2: ";
     int choice;
     std::cin >> choice;
-    char current = (choice == 1) ? 'R' : 'Y';
-    
-    GameState state;
+    currentPlayer = (choice == 1) ? 'R' : 'Y';
+
     while (true) {
-        display_board(state);
-        auto moves = state.get_valid_moves();
-        if (moves.empty()) {
-            std::cout << "Game Over! It's a draw!\n";
+        ClearScreen();
+        DisplayBoard();
+        
+        if (currentPlayer == 'R') {
+            int move;
+            std::cout << "Your move (1-7): ";
+            std::cin >> move;
+            if (move < 1 || move > 7) continue;
+            if (!DropPiece(move-1, 'R')) continue;
+        } else {
+            int aiMove = FindBestMove();
+            DropPiece(aiMove, 'Y');
+        }
+        
+        if (CheckWin(currentPlayer)) {
+            ClearScreen();
+            DisplayBoard();
+            std::cout << (currentPlayer == 'R' ? "You win!" : "AI wins!") << "\n";
             break;
         }
-
-        if (current == 'R') {
-            int move;
-            do {
-                std::cout << "Your move (1-7): ";
-                std::cin >> move;
-                move--;
-            } while (std::find(moves.begin(), moves.end(), move) == moves.end());
-            
-            if (state.make_move(move, 'R')) {
-                display_board(state);
-                std::cout << "Congratulations! You win!\n";
-                system("pause");
-                return 0;
-            }
-        } else {
-            auto start = std::chrono::high_resolution_clock::now();
-            int move = hybrid_decision(state);
-            auto end = std::chrono::high_resolution_clock::now();
-            
-            if (state.make_move(move, 'Y')) {
-                display_board(state);
-                std::cout << "AI wins!\n";
-                system("pause");
-                return 0;
-            }
-            
-            std::cout << "AI chose column " << (move+1) 
-                      << " (" << std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count()
-                      << "ms)\n";
-        }
-
-        current = (current == 'R') ? 'Y' : 'R';
+        currentPlayer = (currentPlayer == 'R') ? 'Y' : 'R';
     }
     system("pause");
     return 0;
